@@ -22,16 +22,14 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import blake from "blakejs";
+import WebSocket from "ws";
+
+// Node.js 20 lacks global WebSocket — polyfill for Ogmios provider
+(globalThis as any).WebSocket = WebSocket;
 
 import {
   MintingBlueprint,
   MeshTxBuilder,
-  mConStr0,
-  mConStr1,
-  byteString,
-  integer,
-  builtinByteString,
-  serializeData,
 } from "@meshsdk/core";
 import { KupoProvider, OgmiosProvider } from "@meshsdk/provider";
 import { AppWallet } from "@meshsdk/wallet";
@@ -158,17 +156,18 @@ async function setup() {
   const compiledCode = loadNotaryCompiledCode();
 
   // Extract the payment key hash from wallet enterprise address
-  // Enterprise address format: 1 byte header + 28 bytes key hash
+  // toBytes() returns hex string: 1 byte header (2 hex chars) + 28 bytes key hash (56 hex chars)
   const usedAddr = wallet.getUsedAddress(0, 0, "enterprise");
-  const addrBytes = usedAddr.toBytes();
-  const keyHashHex = Buffer.from(addrBytes.slice(1, 29)).toString("hex");
+  const addrHex = usedAddr.toBytes() as unknown as string;
+  const keyHashHex = addrHex.slice(2, 58);
   log(`Notarizer key hash: ${keyHashHex}`);
 
   const blueprint = new MintingBlueprint("V3");
-  blueprint.paramScript(compiledCode, [
-    builtinByteString(keyHashHex),
-    integer(config.notary.feeLovelace),
-  ]);
+  blueprint.paramScript(
+    compiledCode,
+    [{ bytes: keyHashHex }, { int: config.notary.feeLovelace }],
+    "JSON"
+  );
 
   const policyId = blueprint.hash;
   const scriptCbor = blueprint.cbor;
@@ -210,19 +209,31 @@ async function testNotarize() {
   log(`Token name: ${tokenName}`);
 
   // Build redeemer: Notarize { output_ref: OutputReference { tx_id, index } }
-  const redeemer = mConStr0([
-    mConStr0([byteString(txHash), integer(txIndex)]),
-  ]);
+  // Using JSON format to avoid BigInt serialization issues with Mesh type
+  // JSON format uses "constructor" key (not "alternative") for Plutus constructors
+  const redeemer = {
+    constructor: 0,
+    fields: [
+      {
+        constructor: 0,
+        fields: [{ bytes: txHash }, { int: txIndex }],
+      },
+    ],
+  };
 
   // Build datum: NotaryDatum
   // Fields: document_hash, hash_algorithm, uri (None), notarizer, description (Some)
-  const datum = mConStr0([
-    byteString(documentHash),
-    byteString(strToHex("SHA-256")),
-    mConStr1([]), // uri: None
-    byteString(ctx.keyHashHex),
-    mConStr0([byteString(strToHex("ADAvault notary integration test"))]), // description: Some
-  ]);
+  // JSON format uses "constructor" key for Plutus constructors
+  const datum = {
+    constructor: 0,
+    fields: [
+      { bytes: documentHash },
+      { bytes: strToHex("SHA-256") },
+      { constructor: 1, fields: [] }, // uri: None
+      { bytes: ctx.keyHashHex },
+      { constructor: 0, fields: [{ bytes: strToHex("ADAvault notary integration test") }] }, // description: Some
+    ],
+  };
 
   log("Building notarization transaction...");
 
@@ -239,17 +250,19 @@ async function testNotarize() {
     .mintPlutusScriptV3()
     .mint("1", ctx.policyId, tokenName)
     .mintingScript(ctx.scriptCbor)
-    .mintRedeemerValue(redeemer)
+    .mintRedeemerValue(redeemer, "JSON")
     // Output: NFT + datum to a script address (or wallet for simplicity)
     .txOut(ctx.walletAddress, [
       { unit: "lovelace", quantity: "2000000" },
       { unit: ctx.policyId + tokenName, quantity: "1" },
     ])
-    .txOutInlineDatumValue(datum)
+    .txOutInlineDatumValue(datum, "JSON")
     // Fee output to notarizer (which is our wallet in this test)
     .txOut(ctx.walletAddress, [
       { unit: "lovelace", quantity: String(config.notary.feeLovelace) },
     ])
+    // Collateral (required for Plutus scripts)
+    .txInCollateral(txHash, txIndex)
     // Required signer (notarizer)
     .requiredSignerHash(ctx.keyHashHex)
     // Change address
@@ -258,6 +271,7 @@ async function testNotarize() {
     .signingKey(ctx.signingKey)
     .complete();
 
+  txBuilder.completeSigning();
   log("Transaction built and signed. Submitting...");
 
   const signedTx = txBuilder.txHex;
@@ -343,8 +357,17 @@ async function testBurn() {
     return;
   }
 
+  // Find a pure-ADA UTxO for collateral (can't use NFT UTxO)
+  const collateralUtxo = utxos.find((u) =>
+    u.output.amount.length === 1 && u.output.amount[0].unit === "lovelace"
+  );
+  if (!collateralUtxo) {
+    log("No pure-ADA UTxO available for collateral");
+    return;
+  }
+
   // Burn redeemer: ConStr1([]) = Burn
-  const burnRedeemer = mConStr1([]);
+  const burnRedeemer = { constructor: 1, fields: [] };
 
   const txBuilder = new MeshTxBuilder({
     fetcher: ctx.kupo,
@@ -359,7 +382,9 @@ async function testBurn() {
     .mintPlutusScriptV3()
     .mint("-1", ctx.policyId, state.tokenName)
     .mintingScript(ctx.scriptCbor)
-    .mintRedeemerValue(burnRedeemer)
+    .mintRedeemerValue(burnRedeemer, "JSON")
+    // Collateral (pure-ADA UTxO required for Plutus scripts)
+    .txInCollateral(collateralUtxo.input.txHash, collateralUtxo.input.outputIndex)
     // Required signer
     .requiredSignerHash(ctx.keyHashHex)
     // Change
@@ -368,6 +393,7 @@ async function testBurn() {
     .signingKey(ctx.signingKey)
     .complete();
 
+  txBuilder.completeSigning();
   log("Burn transaction built. Submitting...");
 
   const signedTx = txBuilder.txHex;
