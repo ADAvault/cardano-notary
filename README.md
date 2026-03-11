@@ -77,18 +77,50 @@ Different parameters = different policy ID = fully independent instances.
 | Component | Status |
 |-----------|--------|
 | Smart contract (Aiken) | Validated — 13 tests passing |
+| Integration test harness | Built — awaiting preview testnet execution |
 | API (notary.adavault.com) | Planned |
 | Verification UI | Planned |
-| Documentation | In progress |
 
 ## Project Structure
 
 ```
 cardano-notary/
-├── contract/        -- Aiken smart contract (planned)
-├── api/             -- Express API for notarization (planned)
-├── docs/            -- Design documents
+├── contract/
+│   └── plutus.json      -- Compiled Aiken blueprint (all validators)
+├── test/
+│   ├── config.ts        -- Provider config, key loading, blueprint parsing
+│   ├── integration.ts   -- End-to-end notarize/verify/burn on preview
+│   └── keys/            -- Signing keys (gitignored)
+├── tsconfig.json
 └── README.md
+```
+
+## Running Integration Tests
+
+### Prerequisites
+
+1. Access to a Cardano preview node with Ogmios + Kupo
+2. A funded preview wallet
+
+### Setup
+
+```bash
+# SSH tunnel to your node (adjust host as needed)
+ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 cardano@your-node
+
+# Copy your payment signing key
+cp /path/to/payment.skey test/keys/payment.skey
+
+# Install dependencies
+npm install
+```
+
+### Run
+
+```bash
+npm test                    # Notarize a document
+npm run test:verify         # Verify an existing notarization
+npm run test:burn           # Burn/revoke a notarization
 ```
 
 ## Related

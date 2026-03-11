@@ -1,0 +1,29 @@
+{
+  "name": "cardano-notary",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Proof-of-existence notary service for Cardano. First of its kind on the chain.",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "tsx test/integration.ts",
+    "test:notarize": "tsx test/integration.ts notarize",
+    "test:verify": "tsx test/integration.ts verify",
+    "test:burn": "tsx test/integration.ts burn"
+  },
+  "keywords": [],
+  "author": "ADAvault",
+  "license": "MIT",
+  "dependencies": {
+    "@meshsdk/core": "^1.9.0-beta.101",
+    "@meshsdk/core-cst": "^1.9.0-beta.101",
+    "blakejs": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
