@@ -343,16 +343,16 @@ async function testWithdraw() {
 
   log(`Found swap UTxO: ${lockedUtxo.output.amount.map((a) => `${a.quantity} ${a.unit}`).join(", ")}`);
 
-  // Find the oracle UTxO (should still be at our wallet since it wasn't consumed)
+  // Find the oracle UTxO by its NFT token (not by tx hash — it may have moved
+  // as change from a subsequent transaction)
+  const oracleUnit = state.oraclePolicyId + ORACLE_TOKEN_NAME_HEX;
   const walletUtxos = await ctx.kupo.fetchAddressUTxOs(ctx.walletAddress);
   const oracleUtxo = walletUtxos.find(
-    (u) =>
-      u.input.txHash === state.oracleTxHash &&
-      u.input.outputIndex === state.oracleTxIndex
+    (u) => u.output.amount.some((a) => a.unit === oracleUnit)
   );
 
   if (!oracleUtxo) {
-    log("Oracle UTxO not found at wallet — may have been spent or Kupo not synced");
+    log("Oracle NFT not found at wallet — check Kupo sync or if NFT was burned");
     return;
   }
   log(`Found oracle UTxO: ${oracleUtxo.input.txHash}#${oracleUtxo.input.outputIndex}`);
@@ -413,6 +413,73 @@ async function testWithdraw() {
 }
 
 // ---------------------------------------------------------------------------
+// Step 4: Refresh Oracle — re-send oracle NFT with inline datum
+// ---------------------------------------------------------------------------
+
+async function testRefreshOracle() {
+  const state = loadState();
+  if (!state?.oraclePolicyId) {
+    log("No oracle state — run 'mint-oracle' first");
+    return;
+  }
+
+  const ctx = await setup();
+
+  // Find the oracle NFT at the wallet (by token, not tx hash)
+  const oracleUnit = state.oraclePolicyId + ORACLE_TOKEN_NAME_HEX;
+  const walletUtxos = await ctx.kupo.fetchAddressUTxOs(ctx.walletAddress);
+  const oracleUtxo = walletUtxos.find(
+    (u) => u.output.amount.some((a) => a.unit === oracleUnit)
+  );
+
+  if (!oracleUtxo) {
+    log("Oracle NFT not found at wallet");
+    return;
+  }
+  log(`Found oracle NFT at: ${oracleUtxo.input.txHash}#${oracleUtxo.input.outputIndex}`);
+
+  // Re-create the oracle datum
+  const oracleDatum = {
+    constructor: 0,
+    fields: [
+      { int: 3_000_000 },
+      { int: Date.now() },
+    ],
+  };
+
+  const txBuilder = new MeshTxBuilder({
+    fetcher: ctx.kupo,
+    submitter: ctx.ogmios,
+  });
+
+  // Explicitly consume the oracle UTxO and send it back with inline datum
+  await txBuilder
+    .txIn(oracleUtxo.input.txHash, oracleUtxo.input.outputIndex)
+    .txOut(ctx.walletAddress, [
+      { unit: "lovelace", quantity: "5000000" },
+      { unit: oracleUnit, quantity: "1" },
+    ])
+    .txOutInlineDatumValue(oracleDatum, "JSON")
+    .changeAddress(ctx.walletAddress)
+    .signingKey(ctx.signingKey)
+    .selectUtxosFrom(walletUtxos)
+    .complete();
+
+  txBuilder.completeSigning();
+  log("Refresh transaction built and signed. Submitting...");
+
+  const signedTx = txBuilder.txHex;
+  const submittedHash = await ctx.ogmios.submitTx(signedTx);
+
+  log(`SUBMITTED! Tx hash: ${submittedHash}`);
+  log("Oracle NFT re-sent with inline datum attached");
+
+  state.oracleTxHash = submittedHash;
+  state.oracleTxIndex = 0;
+  saveState(state);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -429,9 +496,12 @@ try {
     case "withdraw":
       await testWithdraw();
       break;
+    case "refresh-oracle":
+      await testRefreshOracle();
+      break;
     default:
       log(`Unknown command: ${command}`);
-      log("Usage: npx tsx test/reference-input.ts [mint-oracle|lock-swap|withdraw]");
+      log("Usage: npx tsx test/reference-input.ts [mint-oracle|lock-swap|withdraw|refresh-oracle]");
       process.exit(1);
   }
 } catch (err) {

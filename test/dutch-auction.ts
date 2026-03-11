@@ -377,11 +377,14 @@ async function testBuy() {
 
   const slot = currentSlot();
 
-  // Set current_time to 180s in the past so the validity range (starting at ~now)
-  // is entirely after current_time - 1. This accounts for preview clock skew.
-  const currentTimeMs = Date.now() - 180_000;
+  // Set invalidBefore to current slot (no safety margin subtracted — we want
+  // the validity range lower bound to be as close to "now" as possible).
+  // Then derive current_time from the invalidBefore slot's POSIX time so
+  // the validator's check (validity_range >= current_time) passes exactly.
+  // Subtract 1ms so current_time < invalidBefore POSIX (strictly after).
   const invalidBeforeSlot = slot - 180;
   const invalidHereafterSlot = slot + 900;
+  const currentTimeMs = slotToPosixMs(invalidBeforeSlot) - 1;
 
   // Compute decayed price: price = start_price - elapsed * decay_per_ms, floored at reserve_price
   const elapsedMs = currentTimeMs - state.auctionStartTime;

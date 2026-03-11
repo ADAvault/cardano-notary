@@ -577,10 +577,12 @@ async function testBurn() {
     fields: [{ bytes: state.baseNameHex }],
   };
 
-  // Spend redeemer: UpdateMetadata = ConStr1 (the shared redeemer type;
-  // the spend handler doesn't discriminate on the redeemer variant,
-  // but we must provide a valid CIP68Action — UpdateMetadata is simplest)
-  const spendRedeemer = { constructor: 1, fields: [] };
+  // Spend redeemer: Burn { token_name } = ConStr2 — the spend handler
+  // checks this variant and skips the continuing output requirement.
+  const spendRedeemer = {
+    constructor: 2,
+    fields: [{ bytes: state.baseNameHex }],
+  };
 
   log("Building burn transaction (spend ref UTxO + burn both tokens)...");
 
