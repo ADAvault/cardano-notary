@@ -248,17 +248,6 @@ async function testUpdate() {
   }
   log(`Collateral UTxO: ${collateralUtxo.input.txHash}#${collateralUtxo.input.outputIndex}`);
 
-  // IndexedRedeemer { input_index: 0, output_index: 0 }
-  // The script input should be at index 0 in sorted tx.inputs.
-  // The continuing output should be at index 0 in tx.outputs (we create it first).
-  const redeemer = {
-    constructor: 0,
-    fields: [
-      { int: 0 },  // input_index
-      { int: 0 },  // output_index
-    ],
-  };
-
   // New datum with token_count+1, same owner
   const newDatum = {
     constructor: 0,
@@ -269,6 +258,32 @@ async function testUpdate() {
   };
 
   const continuingAmount = "5000000"; // 5 tADA — same amount back to script
+
+  // Pick a wallet UTxO for fees and determine redeemer indices.
+  // On Cardano, tx.inputs are sorted lexicographically by (txHash, outputIndex).
+  // We must know the script input's position in the sorted list to set input_index.
+  const feeUtxo = walletUtxos.find(
+    (u) => u.output.amount.length === 1 &&
+      u.output.amount[0].unit === "lovelace" &&
+      (u.input.txHash !== collateralUtxo.input.txHash ||
+       u.input.outputIndex !== collateralUtxo.input.outputIndex)
+  ) || walletUtxos[0];
+
+  // Determine sorted input order: script UTxO vs fee UTxO
+  const scriptRef = `${lockedUtxo.input.txHash}#${lockedUtxo.input.outputIndex}`;
+  const feeRef = `${feeUtxo.input.txHash}#${feeUtxo.input.outputIndex}`;
+  const scriptInputIndex = scriptRef < feeRef ? 0 : 1;
+  log(`Script input sorts ${scriptInputIndex === 0 ? "first" : "second"} (script: ${scriptRef.slice(0,12)}..., fee: ${feeRef.slice(0,12)}...)`);
+
+  // IndexedRedeemer { input_index, output_index: 0 }
+  // output_index 0 = our continuing output (first .txOut() call)
+  const redeemer = {
+    constructor: 0,
+    fields: [
+      { int: scriptInputIndex },  // input_index — determined by sort order
+      { int: 0 },                 // output_index — continuing output is first
+    ],
+  };
 
   const txBuilder = new MeshTxBuilder({
     fetcher: ctx.kupo,
@@ -283,6 +298,8 @@ async function testUpdate() {
     .txInScript(state.scriptCbor)
     .txInInlineDatumPresent()
     .txInRedeemerValue(redeemer, "JSON")
+    // Explicit fee input — controls the sort order so we know the input_index
+    .txIn(feeUtxo.input.txHash, feeUtxo.input.outputIndex)
     // CONTINUING OUTPUT — must be at output index 0
     // Validator checks: output at output_index has same owner + lovelace >= input lovelace
     .txOut(state.scriptAddress, [
@@ -295,8 +312,6 @@ async function testUpdate() {
     .changeAddress(ctx.walletAddress)
     // Sign
     .signingKey(ctx.signingKey)
-    // Wallet UTxOs for fee coverage (script input nets to zero: 5 ADA in, 5 ADA out)
-    .selectUtxosFrom(walletUtxos)
     .complete();
 
   txBuilder.completeSigning();

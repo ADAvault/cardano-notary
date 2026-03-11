@@ -263,10 +263,10 @@ async function testSpendAfter() {
     ],
   };
 
-  // Set invalidBefore to currentSlot - 60 (safety margin for clock skew)
-  // This sets the lower bound of the validity range to ~now
+  // Set invalidBefore to currentSlot - 180 (safety margin for clock skew)
+  // Ledger tip can lag 60-120s behind wall clock on preview
   const slot = currentSlot();
-  const invalidBeforeSlot = slot - 60;
+  const invalidBeforeSlot = slot - 180;
   log(`invalidBefore slot: ${invalidBeforeSlot} (current slot: ${slot})`);
 
   const txBuilder = new MeshTxBuilder({
