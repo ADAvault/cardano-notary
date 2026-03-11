@@ -1,6 +1,7 @@
 node_modules/
 dist/
 test/keys/
+test/*-state.json
 test/state.json
 *.js
 *.d.ts

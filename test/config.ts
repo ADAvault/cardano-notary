@@ -66,14 +66,23 @@ export function loadSigningKey(): string {
  * Load the blueprint and extract the notary validator's compiled code.
  */
 export function loadNotaryCompiledCode(): string {
+  return loadValidatorCompiledCode("notary.notary.mint");
+}
+
+/**
+ * Load any validator's compiled code from the blueprint by title.
+ * Titles follow the pattern: "module.validator_name.handler"
+ * e.g. "vesting.vesting.spend", "gift_card.gift_card.mint"
+ */
+export function loadValidatorCompiledCode(title: string): string {
   const blueprint = JSON.parse(
     readFileSync(config.blueprintPath, "utf-8")
   );
   const validator = blueprint.validators.find(
-    (v: { title: string }) => v.title === "notary.notary.mint"
+    (v: { title: string }) => v.title === title
   );
   if (!validator) {
-    throw new Error("notary.notary.mint not found in blueprint");
+    throw new Error(`${title} not found in blueprint`);
   }
   return validator.compiledCode;
 }
