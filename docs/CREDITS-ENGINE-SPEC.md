@@ -24,7 +24,8 @@ credit balances, usage metering, and pluggable payment providers.
 10. [Security](#10-security)
 11. [Operational](#11-operational)
 12. [Phased Delivery](#12-phased-delivery)
-13. [Open Items](#13-open-items)
+13. [Testing](#13-testing)
+14. [Open Items](#14-open-items)
 
 ---
 
@@ -960,7 +961,190 @@ requirements tighten.
 
 ---
 
-## 13. Open Items
+## 13. Testing
+
+The credits engine is a standalone reusable component with no dependency on any specific consumer service (notary, vault, etc.). All tests validate engine behaviour in isolation.
+
+### 13.1 Unit Tests
+
+#### Key Management
+
+| Test | Description |
+|------|-------------|
+| Create key | `createKey()` returns full key once, stores SHA-256 hash |
+| Key validation — valid | `validateKey()` with correct key returns key record |
+| Key validation — invalid | `validateKey()` with unknown key returns null |
+| Key validation — suspended | `validateKey()` returns key with status `suspended` |
+| Key validation — revoked | `validateKey()` returns key with status `revoked` |
+| Prefix lookup — unique | Prefix matching exactly one key returns that key |
+| Prefix lookup — ambiguous | Prefix matching multiple keys returns error with matches listed |
+| Prefix lookup — none | Prefix matching zero keys returns error |
+| Key format | Generated key matches `adv_{env}_{24 base62 chars}` pattern |
+| Key hash storage | Stored `key_hash` equals `SHA-256(full_key)` |
+
+#### Balance Operations
+
+| Test | Description |
+|------|-------------|
+| Top-up | `topup()` increases `available` by amount |
+| Reserve — sufficient | `reserve()` decreases `available`, increases `reserved` |
+| Reserve — exact balance | `reserve()` with amount == available succeeds, leaves available at 0 |
+| Reserve — insufficient | `reserve()` with amount > available returns false, balances unchanged |
+| Deduct | `deduct()` decreases `reserved`, increases `lifetime_used` |
+| Release | `release()` decreases `reserved`, increases `available` |
+| Adjust — positive | `adjust()` with positive amount increases `available` |
+| Adjust — negative | `adjust()` with negative amount decreases `available` |
+| Refund | `refund()` increases `available`, creates ledger entry with type `refund` |
+
+#### Ledger Integrity
+
+| Test | Description |
+|------|-------------|
+| Every operation creates entry | Each of topup/reserve/deduct/release/adjust/refund produces exactly one ledger row |
+| Balance snapshot correct | `balance_after` on each ledger entry matches `available` at that point in time |
+| Append-only | No ledger rows are updated or deleted after creation |
+| Ledger ordering | Entries returned in chronological order by `id` |
+| Reference stored | Ledger entry includes the reference passed to the operation |
+
+#### Permissions Validation
+
+| Test | Description |
+|------|-------------|
+| Wildcard permission | Key with `["*"]` has access to all services and operations |
+| Service scope | Key with `["notary"]` has access to all notary operations |
+| Operation scope | Key with `["notary:notarize"]` has access only to notarize |
+| No match | Key with `["vault"]` is denied access to notary operations |
+| Valid JSON roundtrip | Permissions stored and retrieved correctly |
+| Invalid JSON fails closed | Corrupted permissions field results in no permissions (deny all) |
+| Malformed scope rejected | Scope not matching `^[a-z_]+(:[a-z_]+)?$` rejected on write |
+
+#### Pricing Lookup
+
+| Test | Description |
+|------|-------------|
+| Known operation | `getCost('notary', 'notarize', 'live')` returns configured cost |
+| Free operation | `getCost('notary', 'verify', 'live')` returns 0 |
+| Missing pricing | `getCost('unknown', 'op', 'live')` returns error |
+| Environment isolation | Live and test pricing can differ for the same operation |
+
+#### Edge Cases
+
+| Test | Description |
+|------|-------------|
+| Reserve exactly available | Succeeds, available becomes 0 |
+| Reserve more than available | Fails, balances unchanged |
+| Multiple reserves | Sequential reserves decrement available cumulatively |
+| Zero-amount topup | Rejected (no-op prevention) |
+| Negative topup | Rejected |
+| SQL CHECK constraints | `available < 0` and `reserved < 0` both raise SQLite constraint errors |
+
+### 13.2 Concurrency Tests
+
+| Test | Description |
+|------|-------------|
+| Parallel reserves — same key | Two concurrent `reserve()` calls for a key with only enough credits for one: exactly one succeeds, one fails. No double-spend. Verified via `BEGIN IMMEDIATE` serialisation. |
+| Parallel topups — same key | Two concurrent `topup()` calls both succeed, final balance reflects both amounts |
+| Reserve + release under load | 50 concurrent reserve/release cycles on the same key: final balance equals starting balance |
+| Busy timeout | Writer blocked beyond `busy_timeout` (5000ms) receives error, does not corrupt state |
+
+### 13.3 Middleware Tests
+
+Uses mock Express `req`/`res`/`next` objects. No HTTP server required.
+
+#### Auth Flow
+
+| Test | Description |
+|------|-------------|
+| Missing key | No `Authorization` header → 401 `Missing API key` |
+| Invalid key | Unknown key in header → 401 `Invalid API key` |
+| Suspended key | Suspended key → 403 `Key suspended or revoked` |
+| Revoked key | Revoked key → 403 `Key suspended or revoked` |
+| Valid key | Active key → calls `next()` |
+
+#### Permissions
+
+| Test | Description |
+|------|-------------|
+| Sufficient scope | Key with matching permission → calls `next()` |
+| Insufficient scope | Key without matching permission → 403 `Insufficient permissions` |
+
+#### Rate Limiting
+
+| Test | Description |
+|------|-------------|
+| Under limit | Requests below `rate_limit` threshold → pass |
+| Over limit | Requests exceeding `rate_limit` → 429 with `retry_after` |
+
+#### Cost Flow
+
+| Test | Description |
+|------|-------------|
+| Free operation | Cost = 0 → no reserve, no deduct, `next()` called |
+| Paid — success | Cost > 0, handler returns 2xx → reserve then deduct |
+| Paid — failure | Cost > 0, handler returns 5xx → reserve then release |
+| Paid — insufficient | Cost > available → 402 with `available` and `required` |
+| on-finished — success | `on-finished` callback fires, `deduct()` called for 2xx |
+| on-finished — failure | `on-finished` callback fires, `release()` called for non-2xx |
+| on-finished — abort | Connection aborted → `release()` called |
+| Reference passed | `req.credits.reference` set by handler is stored in ledger entry |
+
+#### Brute Force Tracking
+
+| Test | Description |
+|------|-------------|
+| Under threshold | 4 failed auth attempts from same IP → still allowed |
+| At threshold | 5 failed auth attempts within 60s from same IP → blocked |
+| Blocked IP | Blocked IP receives 429 regardless of key validity |
+| Block expires | After 15 minutes, previously blocked IP is allowed again |
+| Different IPs | Failures from different IPs tracked independently |
+
+### 13.4 Orphan Cleanup Tests
+
+| Test | Description |
+|------|-------------|
+| Orphaned reservation released | Reservation older than 10 minutes with no matching deduction or release → `release()` called, credits returned to `available` |
+| Active reservation untouched | Reservation less than 10 minutes old → not released |
+| Cleanup logs warning | Each released orphan produces a `log.warn` with `keyId` and `amount` |
+| Multiple orphans | Multiple orphaned reservations across different keys all released in one cleanup pass |
+| No orphans | Cleanup with no orphans completes without error and without modifying any balances |
+
+### 13.5 CLI Tool Tests
+
+| Test | Description |
+|------|-------------|
+| `create-key` | Outputs full key to stdout, stores hash in DB, creates balance row |
+| `create-key` — display once | Full key not retrievable after creation (only prefix visible) |
+| `topup` | Increases balance, creates ledger entry with type `topup` and provider `manual` |
+| `balance` | Displays correct `available`, `reserved`, and `lifetime_used` |
+| `revoke-key` | Sets key status to `revoked`, records `revoked_at` timestamp |
+| `suspend-key` | Sets key status to `suspended` |
+| `refund` | Increases balance, creates ledger entry with note as reference |
+| `prefix collision` | Ambiguous prefix → exits non-zero with error listing matching key prefixes |
+| `prefix not found` | Unknown prefix → exits non-zero with error message |
+
+### 13.6 Backup & Restore Tests
+
+| Test | Description |
+|------|-------------|
+| WAL checkpoint | `PRAGMA wal_checkpoint(TRUNCATE)` before backup completes without error |
+| Backup creates file | `.backup()` produces a valid SQLite file at the target path |
+| Restore integrity | Restored DB passes `PRAGMA integrity_check`, all FK constraints hold |
+| Ledger totals match | Sum of ledger entries per key matches `lifetime_used` in balances table |
+| Available balance consistent | `available` matches topups - deductions - (active reserves) + releases + refunds + adjustments |
+| Lock timeout | Backup script exits non-zero if SQLite is locked beyond `busy_timeout` |
+
+### 13.7 Test Environment
+
+- **Runtime:** All unit, middleware, and CLI tests run locally and in CI with no external dependencies.
+- **Database:** In-memory SQLite (`:memory:`) for unit tests. WAL mode and `BEGIN IMMEDIATE` behave identically to on-disk SQLite — same concurrency guarantees.
+- **CI integration:** Runs on every push alongside the existing pipeline (gitleaks → audit → typecheck → lint → build → credits tests → E2E).
+- **No testnet dependency:** The credits engine is entirely off-chain. No preview/preprod/mainnet interaction required.
+- **Test data:** Factory functions create keys, balances, and pricing entries with deterministic values. No shared mutable state between tests.
+- **Concurrency tests:** Use `Promise.all()` with multiple concurrent engine calls against a shared in-memory DB to verify `BEGIN IMMEDIATE` serialisation.
+
+---
+
+## 14. Open Items
 
 | # | Item | Status | Owner |
 |---|------|--------|-------|

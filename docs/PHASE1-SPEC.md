@@ -23,6 +23,8 @@ Detailed specification for Phase 1: API-mediated notarization with verification 
 9. [Security](#9-security)
 10. [Testing Plan](#10-testing-plan)
 11. [Open Items](#11-open-items)
+12. [Implementation Plan](#12-implementation-plan)
+13. [Deployment Runbook](#13-deployment-runbook)
 
 ---
 
@@ -939,7 +941,7 @@ Playwright E2E tests (extend existing harness):
 | 4 | Notary history page | Deferred to Phase 1.5 — now feasible via API key (credits engine tracks usage) | Dev team |
 | 5 | Monitoring/alerting | BetterStack monitor for notary-specific health endpoint | Dev team |
 | 6 | Mainnet operator key | Generate, encrypt, secure storage plan | Dev team + CxO |
-| 7 | Credits engine open items | 9 items in [CREDITS-ENGINE-SPEC.md §13](CREDITS-ENGINE-SPEC.md#13-open-items) | Mixed |
+| 7 | Credits engine open items | 9 items in [CREDITS-ENGINE-SPEC.md §14](CREDITS-ENGINE-SPEC.md#14-open-items) | Mixed |
 
 ---
 
@@ -972,3 +974,339 @@ Token name = blake2b_256(CBOR) = <32 bytes hex>
 ```
 
 This is deterministic — anyone can independently derive the token name from the UTxO reference.
+
+---
+
+## 12. Implementation Plan
+
+Build order with dependencies. Each phase has a test gate that must pass before proceeding.
+
+### Phase A: Credits Engine Core
+
+**No external dependencies.** Pure library code with unit tests.
+
+**Build:**
+- SQLite schema and migrations (`store.ts`) — tables: `schema_version`, `api_keys`, `balances`, `ledger`, `pricing`
+- Engine core (`engine.ts`) — key creation (generate, hash, store), key validation, balance operations (`topup`, `reserve`, `deduct`, `release`, `refund`, `adjust`), ledger append, cost lookup from `pricing` table
+- Types and interfaces (`types.ts`) — `ApiKey`, `Balance`, `LedgerEntry`, `CreditContext`, `ProviderConfig`, `TopupResult`, `PaymentVerification`
+- Manual provider (`providers/manual.ts`) — direct `topup()` call with admin note as reference
+- CLI tools:
+  - `credits:create-key` — generate key, display once, store hash
+  - `credits:topup` — add credits by key prefix (with collision check)
+  - `credits:balance` — show available/reserved/lifetime for a key
+  - `credits:revoke-key` — set key status to `revoked`, record `revoked_at`
+  - `credits:suspend-key` — set key status to `suspended`
+  - `credits:list-keys` — all keys with prefix, name, status, balance, last used
+  - `credits:refund` — operator-initiated credit return
+  - `credits:migrate` — run pending schema migrations
+  - `credits:ledger` — dump ledger entries for a key
+  - `credits:report` — aggregate usage report for a date range
+
+**Test gate:** All credits engine unit tests pass (see [CREDITS-ENGINE-SPEC.md §13](CREDITS-ENGINE-SPEC.md#13-testing)):
+- Key creation, validation, prefix lookup
+- Balance operations (topup, reserve, deduct, release, adjust, refund)
+- Ledger integrity (every operation creates entry, balance_after correct)
+- Concurrent reserves cannot double-spend (`BEGIN IMMEDIATE`)
+- Permissions validation (fail closed on corrupt data)
+- `CHECK` constraints prevent negative balances
+- Schema migration runs idempotently
+
+### Phase B: Credits Middleware
+
+**Depends on:** Phase A (engine and store must be complete and tested).
+
+**Build:**
+- Express middleware (`middleware.ts`) — full request lifecycle: extract bearer token, validate key, check permissions, check rate limit, reserve credits, call `next()`, deduct on success / release on failure via `on-finished`
+- Per-key rate limiting — in-memory sliding window map, configurable per key via `api_keys.rate_limit`
+- Brute force tracking — in-memory IP map: 5 failed auth attempts within 60 seconds blocks IP for 15 minutes
+- Orphan reservation cleanup — background job every 5 minutes, releases reservations older than 10 minutes with no matching deduction or release
+- Request context injection — `req.credits = { keyId, cost, service, operation, reference }`
+
+**Test gate:** All middleware tests pass (mock `req`/`res`/`next`):
+- Auth flow (401/403 for missing/invalid/suspended/revoked keys)
+- Permissions enforcement
+- Rate limiting (429 with `retry_after`)
+- Cost flow (reserve → deduct on 2xx, reserve → release on non-2xx)
+- `on-finished` fires on connection abort
+- Orphan cleanup releases stale reservations
+- Brute force tracking blocks after 5 failures, clears after 15 min
+- Manual smoke test against dev API (vduweb32)
+
+### Phase C: Notary API Routes
+
+**Depends on:** Phase B (middleware must be wired and tested).
+
+**Build:**
+- `POST /api/v1/notary/notarize` — validate input, select and lock UTxO, build mint transaction (MeshJS + reference script), sign with operator key, submit to Ogmios, return 202
+- `GET /api/v1/notary/verify/:hash` — query Kupo, filter by `document_hash`, return matches with slot-to-timestamp conversion. No auth required.
+- `GET /api/v1/notary/certificate/:policyId/:tokenName` — query Kupo for specific NFT UTxO, parse inline datum, return full certificate data. Check revocation index. No auth required.
+- `DELETE /api/v1/notary/:policyId/:tokenName` — admin only (`notary:burn` permission), build burn transaction, submit
+- `GET /api/v1/notary/recent` — recent notarizations from cache
+- `GET /api/v1/notary/stats` — aggregate counts
+- Credits management routes: `GET /api/v1/credits/balance`, `GET /api/v1/credits/usage`, `GET /api/v1/credits/ledger`
+- Auto-refund background job — every 60s, checks submitted notarizations older than 5 min, refunds if not confirmed on-chain
+- UTxO selection locking — in-memory `Set<string>`, 2-minute timeout
+- Duplicate detection — check cache for same `document_hash` by same notarizer, return 409 unless `allow_duplicate: true`
+- Revocation tracking — SQLite index of burned token names, certificate endpoint returns `status: "revoked"`
+
+**Test gate:** All API tests pass against preview testnet:
+- Happy path notarize returns 202 with tx hash
+- Auth/credits error codes (401, 402, 400, 409)
+- Verify returns match for known notarization
+- Certificate returns full datum
+- Burn with admin key succeeds, certificate shows revoked
+- Credits deducted on success, released on failure
+- Auto-refund returns credits for timed-out transactions
+- Rate limiting enforced
+
+### Phase D: Frontend
+
+**Depends on:** Phase C partially. Verify and certificate pages work independently (free, no credits). Submit page needs the notarize endpoint.
+
+**Build:**
+- `/notary` page — `FileHasher` component (drag-and-drop, Web Crypto SHA-256), `NotarySubmitForm`, `NotaryResult` (confirmation polling), `NotaryRecentFeed`
+- `/notary/verify` page — `NotaryVerifyForm` component (file drop or hash paste, result display)
+- `/notary/certificate/:policyId/:tokenName` page — `NotaryCertificate` component (formatted certificate, QR code, CardanoScan link, revocation banner, Open Graph meta)
+- `/notary/about` page — static content (how it works, pricing, FAQ, API docs link)
+- Mobile responsive on all pages
+- Route reservation for `/notary/history` (placeholder — Phase 1.5)
+
+**Test gate:** Playwright E2E tests pass in CI:
+- All notary pages load without errors
+- File drop computes correct SHA-256 hash
+- Manual hash input validated (64 hex chars)
+- Certificate page renders correctly
+- All pages render on mobile viewport (375px)
+- ViewTransitions navigation works between notary pages
+
+### Phase E: Integration and Hardening
+
+**Depends on:** Phase C (API complete) + Phase D (frontend complete).
+
+**Build:**
+- Full lifecycle test: create key → top up → notarize → verify → certificate → burn → verify shows revoked
+- Preprod deployment with different operator key, full regression
+- Monitoring: extend `/health` with `notary_wallet_ada`, `credits_engine`, `kupo_connected`
+- BetterStack monitors for notary endpoints on both sites
+- Wallet balance alert (< 20 ADA)
+- Credits backup cron (hourly, rsync to DR)
+- Documentation: Swagger/OpenAPI spec, user guide content for `/notary/about`
+
+**Test gate:**
+- Full lifecycle passes on preprod
+- Health endpoint returns notary status fields
+- BetterStack monitors receiving pings
+- Credits backup cron produces valid backup, rsync to DR succeeds
+
+### Phase F: Mainnet Launch
+
+**Depends on:** Phase E complete + CxO approval.
+
+1. Generate mainnet operator key pair, encrypt at rest (GPG)
+2. Fund operator wallet (~50 ADA)
+3. Deploy reference script on mainnet
+4. Add Kupo pattern for mainnet notary policy ID
+5. Deploy to vduweb42 (production) — see §13.2
+6. Deploy to vduweb62 (DR) — see §13.3
+7. Configure nginx on vduprx05 and pduprx06 — see §13.4, §13.5
+8. DNS (if new domain — pending branding decision)
+9. Enable BetterStack monitors
+10. Smoke test on mainnet
+11. CxO sign-off
+
+---
+
+## 13. Deployment Runbook
+
+Step-by-step checklist for deploying to production.
+
+### 13.1 Prerequisites
+
+- [ ] Credits engine tested on dev (vduweb32) — all unit and middleware tests passing
+- [ ] Notary API tested on preview — all Phase C tests passing
+- [ ] Notary API tested on preprod — full lifecycle regression passing
+- [ ] CxO approval for mainnet release
+- [ ] Mainnet operator key generated and encrypted (GPG)
+- [ ] Mainnet reference script deployed on-chain, UTxO recorded
+- [ ] Kupo pattern added for mainnet notary policy ID
+- [ ] Operator wallet funded (~50 ADA)
+- [ ] nginx config prepared (reviewed, not yet applied)
+- [ ] BetterStack monitors configured (created, not yet enabled)
+- [ ] Credits backup cron script prepared
+
+### 13.2 Production Deployment (vduweb42)
+
+```bash
+# 1. SSH to production API server
+ssh rezi@vduweb42
+
+# 2. Pull latest code
+cd ~/products/adavault-api
+git pull origin main
+
+# 3. Source nvm and install dependencies
+export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+npm install
+npm run build
+
+# 4. Run credits database migrations
+npm run credits:migrate
+
+# 5. Create admin API key (save the output — shown once only)
+npm run credits:create-key -- --name "Operator" --env live --admin
+# Output: adv_admin_XXXXXXXXXXXXXXXXXXXXXXXXXXXX  ← SAVE THIS
+
+# 6. Set environment variables (add to PM2 ecosystem config or .env)
+#    NOTARY_SKEY_PATH=/path/to/mainnet-notary.skey
+#    NOTARY_NETWORK=mainnet
+#    NOTARY_REF_SCRIPT_TX=<tx_hash>
+#    NOTARY_REF_SCRIPT_IDX=<output_index>
+#    NOTARY_POLICY_ID=<policy_id>
+#    CREDITS_DB_PATH=data/credits.db
+
+# 7. Restart the API process
+pm2 restart adavault-api-prod
+
+# 8. Health check
+curl http://localhost:3001/health
+# Expect: { ..., "credits_engine": "ok", "notary_wallet_ada": 47.5, ... }
+
+# 9. Smoke test
+npm run credits:create-key -- --name "Smoke test" --env live
+npm run credits:topup -- --key-prefix "adv_live_XXXX" --amount 10 --note "Smoke test"
+curl -X POST http://localhost:3001/api/v1/notary/notarize \
+  -H "Authorization: Bearer adv_live_XXXXXXXXXXXXXXXXXXXXXXXXXXXX" \
+  -H "Content-Type: application/json" \
+  -d '{"document_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}'
+# Expect: 202 with tx_hash
+
+# 10. Verify credits deducted
+npm run credits:balance -- --key-prefix "adv_live_XXXX"
+
+# 11. Set up credits backup cron (hourly)
+# 0 * * * * /home/rezi/products/adavault-api/scripts/backup-credits.sh
+```
+
+### 13.3 DR Deployment (vduweb62)
+
+DR is read-only for credits mutations. Write operations (notarize, burn, topup) are blocked.
+
+```bash
+# 1. SSH via jump host
+ssh -J rezi@ren rezi@vduweb62
+
+# 2. Pull and build
+cd ~/products/adavault-api
+git pull origin main
+export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+npm install
+npm run build
+
+# 3. Run migrations (creates empty schema)
+npm run credits:migrate
+
+# 4. Copy credits.db from primary (initial sync)
+# From vduweb42:
+rsync -avz rezi@vduweb42:~/products/adavault-api/data/credits.db \
+  ~/products/adavault-api/data/credits.db
+
+# 5. Set environment variables (same as production + CREDITS_READ_ONLY=true)
+
+# 6. Restart
+pm2 restart adavault-api-prod
+
+# 7. Health check
+curl http://localhost:3001/health
+```
+
+### 13.4 Reverse Proxy — vduprx05 (Linux)
+
+```bash
+ssh rezi@vduprx05
+sudo vi /etc/nginx/sites-available/api-adavault-com.conf
+
+# Add rate limiting zones (in http context):
+#   limit_req_zone $binary_remote_addr zone=notary_write:10m rate=10r/m;
+#   limit_req_zone $binary_remote_addr zone=notary_read:10m rate=60r/m;
+#
+# Add location blocks:
+#   location /api/v1/notary/notarize {
+#       limit_req zone=notary_write burst=5 nodelay;
+#       proxy_pass http://api_backend;
+#   }
+#   location /api/v1/notary/ {
+#       limit_req zone=notary_read burst=20 nodelay;
+#       proxy_pass http://api_backend;
+#   }
+#   location /api/v1/credits/ {
+#       limit_req zone=notary_read burst=20 nodelay;
+#       proxy_pass http://api_backend;
+#   }
+
+sudo nginx -t && sudo systemctl reload nginx
+curl https://api.adavault.com/api/v1/notary/stats
+```
+
+### 13.5 DR Reverse Proxy — pduprx06 (FreeBSD)
+
+```bash
+ssh -J rezi@ren cyberruss@pduprx06
+sudo vi /usr/local/etc/nginx/servers/api2.adavault.com.conf
+
+# Add same rate limiting zones and location blocks as vduprx05
+
+sudo nginx -t && sudo service nginx reload
+curl https://api2.adavault.com/api/v1/notary/stats
+```
+
+### 13.6 Monitoring
+
+1. **BetterStack — notary health:** Enable monitor for `https://api.adavault.com/api/v1/notary/stats`. Check interval: 3 minutes. Alert on non-200.
+2. **BetterStack — DR:** Same for `https://api2.adavault.com/api/v1/notary/stats`.
+3. **Wallet balance alert:** BetterStack keyword monitor on `/health` response — alert if `notary_wallet_ada` drops below 20.
+4. **Credits backup cron:** Verify hourly cron is running: `crontab -l | grep credits`
+5. **DR rsync:** Verify `credits.db` on vduweb62 is within 1 hour of primary.
+
+### 13.7 Rollback Plan
+
+**API rollback:**
+```bash
+cd ~/products/adavault-api
+git log --oneline -5          # Find previous good commit
+git checkout <previous-tag>
+npm run build
+pm2 restart adavault-api-prod
+```
+
+**Credits DB rollback:**
+```bash
+pm2 stop adavault-api-prod
+cp ~/products/adavault-api/data/backups/credits-<timestamp>.db \
+   ~/products/adavault-api/data/credits.db
+pm2 start adavault-api-prod
+```
+
+**nginx rollback:**
+```bash
+# vduprx05: remove notary blocks, reload
+sudo nginx -t && sudo systemctl reload nginx
+
+# pduprx06 (via jump host, as cyberruss): remove notary blocks, reload
+sudo nginx -t && sudo service nginx reload
+```
+
+**On-chain — no rollback possible.** Minted NFTs are permanent. Burned NFTs cannot be re-minted. The reference script UTxO remains on-chain. This is expected — on-chain state is the source of truth.
+
+### 13.8 Post-Launch Checklist
+
+- [ ] Health endpoint green on api.adavault.com
+- [ ] Health endpoint green on api2.adavault.com
+- [ ] BetterStack monitoring active for both sites
+- [ ] First test notarization confirmed on mainnet
+- [ ] Certificate page renders correctly
+- [ ] Verification returns the test notarization
+- [ ] Credits backup cron running (verified by file timestamps)
+- [ ] DR rsync verified (credits.db on vduweb62 is current)
+- [ ] Wallet balance monitor configured and tested
+- [ ] Admin API key stored securely (not in shared notes, not in git)
+- [ ] CxO notified of go-live
