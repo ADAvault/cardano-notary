@@ -76,21 +76,26 @@ Different parameters = different policy ID = fully independent instances.
 
 | Component | Status |
 |-----------|--------|
-| Smart contract (Aiken) | Validated — 13 tests passing |
-| Integration test harness | Built — awaiting preview testnet execution |
-| API (notary.adavault.com) | Planned |
-| Verification UI | Planned |
+| Smart contract (Aiken) | Validated — 13 tests (11 unit + 2 property-based) |
+| E2E test harness | Passing — 61/61 operations on preview testnet |
+| Phase 1 spec | Complete — [PHASE1-SPEC.md](docs/PHASE1-SPEC.md) |
+| Credits engine spec | Complete — [CREDITS-ENGINE-SPEC.md](docs/CREDITS-ENGINE-SPEC.md) |
+| API | Development — Phase A (credits engine core) |
+| Verification UI | Planned — Phase D |
 
 ## Project Structure
 
 ```
 cardano-notary/
 ├── contract/
-│   └── plutus.json      -- Compiled Aiken blueprint (all validators)
+│   └── plutus.json          -- Compiled Aiken blueprint (all validators)
+├── docs/
+│   ├── PHASE1-SPEC.md       -- Phase 1 service specification
+│   └── CREDITS-ENGINE-SPEC.md -- Reusable API billing component spec
 ├── test/
-│   ├── config.ts        -- Provider config, key loading, blueprint parsing
-│   ├── integration.ts   -- End-to-end notarize/verify/burn on preview
-│   └── keys/            -- Signing keys (gitignored)
+│   ├── config.ts            -- Provider config, key loading, blueprint parsing
+│   ├── integration.ts       -- End-to-end notarize/verify/burn on preview
+│   └── keys/                -- Signing keys (gitignored)
 ├── tsconfig.json
 └── README.md
 ```
@@ -122,6 +127,11 @@ npm test                    # Notarize a document
 npm run test:verify         # Verify an existing notarization
 npm run test:burn           # Burn/revoke a notarization
 ```
+
+## Documentation
+
+- [Phase 1 Specification](docs/PHASE1-SPEC.md) — API-mediated notarization service with credits engine, implementation plan, and deployment runbook
+- [Credits Engine Specification](docs/CREDITS-ENGINE-SPEC.md) — Reusable API billing component (API keys, credit balances, pluggable payment providers)
 
 ## Related
 
