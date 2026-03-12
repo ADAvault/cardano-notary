@@ -125,7 +125,7 @@ npm run test:burn           # Burn/revoke a notarization
 
 ## Related
 
-- [aiken-skill](https://github.com/adavault/aiken-skill) — Claude Code skill for Aiken development (includes the notary as a validated example)
+- [cardano-skill](https://github.com/ADAvault/cardano-skill) — Claude Code skill for Aiken development (includes the notary as a validated example)
 - [ADAvault](https://adavault.com) — Cardano stake pool operator
 
 ## License
