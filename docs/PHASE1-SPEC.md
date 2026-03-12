@@ -96,7 +96,7 @@ User                          Frontend                         API              
 
 **Key points:**
 - File never leaves the browser — only the hash is sent to the API
-- Hash is computed client-side using Web Crypto API (SHA-256) or browser BLAKE2b
+- Hash is computed client-side using Web Crypto API (SHA-256). BLAKE2b-256 hashes must be computed externally and pasted manually (Web Crypto does not support BLAKE2b)
 - User can paste a pre-computed hash instead of dropping a file
 - Optional: URI (where document lives, e.g. IPFS CID), description, destination address
 - Response includes a certificate URL for sharing
@@ -186,22 +186,22 @@ User                          Frontend                         API
 ```
 
 **Key points:**
-- Certificate is a static page — can be bookmarked, shared, linked
-- Shows burn status (active vs revoked)
+- Certificate is a bookmarkable, shareable URL. The page shell is pre-built (Astro), but content is loaded dynamically via a React island that fetches from the API
+- Shows revocation status (active vs revoked)
 - Includes external verification link (CardanoScan)
 - Machine-readable: `Accept: application/json` returns raw data
 
 ### Journey 4: Revoke a Notarization
 
-**Actor:** Operator only (authenticated)
-**Goal:** Burn the NFT to invalidate a notarization
+**Actor:** Admin only (authenticated with `adv_admin_` key)
+**Goal:** Burn the NFT on-chain to invalidate a notarization
 
 ```
-Operator                       API                            Cardano
+Admin                          API                            Cardano
  │                              │                               │
  │  1. DELETE /notary/          │                               │
  │     :policyId/:tokenName     │                               │
- │     (authenticated)          │                               │
+ │     (admin API key)          │                               │
  │─────────────────────────────>│                               │
  │                              │  2. Find NFT UTxO             │
  │                              │  3. Build burn tx             │
@@ -213,10 +213,12 @@ Operator                       API                            Cardano
 ```
 
 **Key points:**
-- Operator-only action — requires API authentication
-- Burns the NFT (quantity -1), making it permanently unspendable
+- Admin-only action — requires API key with `notary:burn` permission (typically `adv_admin_` key)
+- Burns the NFT on-chain (quantity -1), making it permanently unspendable
 - Certificate page shows "Revoked" status after burn
 - Verification still returns the record but marked as revoked
+
+**Terminology:** "Revoke" is the business action (invalidating the notarization). "Burn" is the on-chain mechanism (destroying the NFT token). The API performs a revocation, which is implemented via a burn transaction.
 
 ---
 
@@ -234,6 +236,8 @@ Operator                       API                            Cardano
 | `fee_lovelace` | `Int` | Minimum lovelace fee per notarization |
 
 Different parameter values = different policy ID = independent instances.
+
+**Migration note:** Changing `fee_lovelace` after deployment creates a new policy ID (a new contract instance). Existing NFTs remain valid under the original policy. The verify endpoint MUST search across all known policy IDs. Document the active policy list in API configuration.
 
 ### Datum
 
@@ -296,11 +300,12 @@ Content-Type: application/json
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `document_hash` | string | Yes | Hex-encoded hash (64 chars for SHA-256, 64 for BLAKE2b-256) |
+| `document_hash` | string | Yes | Hex-encoded hash, 64 chars (both SHA-256 and BLAKE2b-256 produce 32-byte / 64 hex char digests). Normalised to lowercase on receipt. |
 | `hash_algorithm` | string | No | `"SHA-256"` (default) or `"BLAKE2b-256"` |
 | `uri` | string | No | Source document location |
 | `description` | string | No | Free-text context (max 256 bytes on-chain) |
-| `destination` | string | No | Bech32 address for NFT output. Default: operator registry address |
+| `destination` | string | No | Bech32 address for NFT output. Default: notarizer registry address |
+| `allow_duplicate` | boolean | No | If `true`, bypass 409 duplicate check. Default: `false` |
 
 **Response (202 Accepted):**
 
@@ -312,11 +317,13 @@ Content-Type: application/json
   "certificate_url": "/notary/certificate/a1b2c3d4.../e5f6a7b8...",
   "explorer_url": "https://cardanoscan.io/transaction/48ae388c...",
   "status": "submitted",
-  "estimated_confirmation": "~20 seconds"
+  "estimated_confirmation_seconds": 20
 }
 ```
 
 **Status:** 202 because the transaction is submitted but not yet confirmed. Certificate URL is valid immediately (shows "pending" until confirmed).
+
+**Confirmation tracking:** The client polls `GET /api/v1/notary/certificate/:policyId/:tokenName` until it returns 200 with `"status": "active"`. Typical confirmation time is ~20 seconds on mainnet. If the transaction fails on-chain (not confirmed within 5 minutes), the API auto-refunds the reserved credits and the certificate endpoint returns `"status": "failed"`. See §7.4 for the auto-refund mechanism.
 
 **Error responses:**
 
@@ -324,7 +331,7 @@ Content-Type: application/json
 |--------|-----------|------|
 | 400 | Invalid hash format, bad address, description too long | `{ "error": "...", "details": "..." }` |
 | 401 | Missing or invalid API key | `{ "error": "unauthorized" }` |
-| 402 | Insufficient credits | `{ "error": "insufficient_credits", "available": 0, "required": 2000 }` |
+| 402 | Insufficient credits | `{ "error": "insufficient_credits", "available": 0, "required": 2000, "unit": "millicredits" }` |
 | 409 | Identical hash already notarized by this operator | `{ "error": "duplicate", "existing_certificate": "/notary/certificate/..." }` |
 | 429 | Rate limited | `{ "error": "rate_limited", "retry_after": 60 }` |
 | 503 | Operator wallet insufficient funds or node unavailable | `{ "error": "service_unavailable", "retry_after": 300 }` |
@@ -411,8 +418,10 @@ GET /api/v1/notary/certificate/:policyId/:tokenName
 
 | Status | Condition |
 |--------|-----------|
-| 200 | Found |
-| 404 | NFT not found (never existed or burned) |
+| 200 | Found (active or revoked) |
+| 404 | NFT never existed (unknown policy/token combination) |
+
+**Revoked notarizations:** Return 200 with `"status": "revoked"` and include the `burn_tx_hash`. Do NOT return 404 for burned NFTs — the certificate must remain viewable to show revocation status.
 
 ### 4.4 Recent Notarizations
 
@@ -421,6 +430,12 @@ GET /api/v1/notary/recent?limit=10
 ```
 
 Returns the most recent notarizations (public, no auth). For the landing page feed.
+
+**Query parameters:**
+
+| Parameter | Type | Default | Max | Description |
+|-----------|------|---------|-----|-------------|
+| `limit` | integer | 10 | 50 | Number of results. Returns 400 if > 50. |
 
 **Response (200):**
 
@@ -458,26 +473,30 @@ GET /api/v1/notary/stats
 }
 ```
 
-### 4.6 Revoke (Operator Only)
+### 4.6 Revoke (Admin Only)
 
 ```
 DELETE /api/v1/notary/:policyId/:tokenName
-Authorization: Bearer <operator-token>
+Authorization: Bearer adv_admin_...
 ```
+
+**Authentication:** Requires API key with `notary:burn` permission (admin keys only). Uses the same credits middleware as notarize — credits are reserved, deducted on success, released on failure.
 
 **Response (202):**
 
 ```json
 {
   "tx_hash": "7dcc5168...",
-  "status": "burn_submitted"
+  "status": "revocation_submitted"
 }
 ```
 
 | Status | Condition |
 |--------|-----------|
-| 202 | Burn submitted |
-| 401 | Missing or invalid auth |
+| 202 | Burn transaction submitted |
+| 401 | Missing or invalid API key |
+| 402 | Insufficient credits |
+| 403 | Key lacks `notary:burn` permission |
 | 404 | NFT not found |
 
 ---
@@ -597,9 +616,10 @@ Deploy the notary validator as a CIP-33 reference script on-chain. This saves ~3
 **Preview/preprod:** Existing preview wallet (`0027a6fe...`)
 **Mainnet:** Dedicated notary operator wallet (new key pair, separate from pool keys)
 
-The operator wallet needs:
-- Sufficient ADA for transactions (~5 ADA reserve minimum)
-- A monitoring alert if balance drops below threshold
+The notarizer wallet needs:
+- Sufficient ADA for transactions (~50 ADA reserve, keep balance low for security)
+- BetterStack monitoring alert if balance drops below 20 ADA (same pattern as existing API health checks)
+- Balance included in `/health` endpoint response (e.g. `"notary_wallet_ada": 47.5`)
 - Key stored securely (encrypted at rest, same pattern as KES rotation)
 
 ### 6.3 Kupo Patterns
@@ -648,7 +668,28 @@ All notarization data lives on-chain as NFT datums. The API is a read layer over
 - **Recent:** Query Kupo for all UTxOs under the policy, sort by slot
 - **Stats:** Count UTxOs under the policy, count burned (query tx history)
 
-### 7.2 Local Cache (Performance)
+### 7.2 Revocation Tracking
+
+Burned NFTs disappear from Kupo (they are no longer UTxOs). To support revoked certificate display and stats, the API maintains a revocation index:
+
+```typescript
+interface RevocationEntry {
+  policyId: string;
+  tokenName: string;
+  originalDatum: NotaryCacheEntry;  // preserved from before burn
+  burnTxHash: string;
+  burnSlot: number;
+  revokedAt: string;
+}
+```
+
+**Detection:** During each cache refresh, if a previously-known token is absent from Kupo, mark it as revoked. Persist the revocation index in SQLite (alongside credits.db or in a separate `notary.db`), so it survives restarts.
+
+**Certificate endpoint:** For revoked tokens, return 200 with `"status": "revoked"`, the original datum fields, and the `burn_tx_hash`.
+
+**Stats:** `revoked` count = size of the revocation index. `active` = current Kupo UTxO count.
+
+### 7.3 Local Cache (Performance)
 
 The API maintains an in-memory cache (same pattern as existing pool data caching):
 
@@ -665,10 +706,55 @@ interface NotaryCache {
 - Refreshed every 60 seconds (same cadence as pool stats)
 - Cold start: full scan of Kupo UTxOs under the policy
 - Incremental: only fetch UTxOs created since last checkpoint
+- **Write-through on notarize:** After a successful mint, insert the new entry into the cache immediately (before the next Kupo refresh). Entry shows as "pending" until Kupo confirms.
 
-### 7.3 Duplicate Detection
+### 7.4 Auto-Refund on On-Chain Failure
 
-Before building a notarization transaction, the API checks its cache for an existing notarization with the same `document_hash` by the same operator. Returns 409 if found — prevents accidental duplicate minting while still allowing intentional re-notarization (different operator or explicit override).
+When the API returns 202, credits are deducted immediately. If the transaction fails to confirm on-chain, credits must be refunded automatically.
+
+**Mechanism:** A background job runs every 60 seconds (piggybacked on the cache refresh cycle):
+1. Check all recent notarizations with status "submitted" older than 5 minutes
+2. Query Kupo for the expected NFT UTxO
+3. If not found after 5 minutes → mark as "failed", issue automatic refund via `engine.refund()`
+4. Log with ledger type `auto_refund` and reference = original tx hash
+
+**Credits flow for a failed tx:**
+- On submit: `reserve(2000)` → `deduct(2000)` (202 returned)
+- After 5 min timeout: `refund(2000)` (auto_refund ledger entry)
+
+### 7.5 UTxO Selection and Locking
+
+Concurrent notarization requests must not select the same UTxO for the one-shot token name derivation.
+
+**Mechanism:** In-memory set of "in-flight" UTxO references (locked during tx building + submission):
+
+```typescript
+const inFlightUtxos = new Set<string>();  // "txHash#outputIndex"
+
+function selectAndLockUtxo(utxos: UTxO[]): UTxO | null {
+  // Select first unlocked pure-ADA UTxO
+  for (const u of utxos) {
+    const key = `${u.input.txHash}#${u.input.outputIndex}`;
+    if (!inFlightUtxos.has(key)) {
+      inFlightUtxos.add(key);
+      return u;
+    }
+  }
+  return null;  // All UTxOs locked — 503, retry later
+}
+
+function releaseUtxo(utxo: UTxO): void {
+  inFlightUtxos.delete(`${utxo.input.txHash}#${utxo.input.outputIndex}`);
+}
+```
+
+UTxOs are released on tx confirmation, tx failure, or after a 2-minute safety timeout.
+
+### 7.6 Duplicate Detection
+
+Before building a notarization transaction, the API checks its cache for an existing notarization with the same `document_hash` by the same notarizer. Returns 409 if found.
+
+**Important:** Duplicate detection is best-effort (cache-based, up to 60s lag after mint). The on-chain contract does NOT enforce hash uniqueness — the API is the only guard. Clients may bypass the check by setting `"allow_duplicate": true` in the request.
 
 ---
 
@@ -679,7 +765,7 @@ Before building a notarization transaction, the API checks its cache for an exis
 | Failure | Cause | API Response | Recovery |
 |---------|-------|-------------|----------|
 | Insufficient funds | Operator wallet drained | 503 + alert | Top up wallet |
-| UTxO contention | Concurrent notarizations consume same UTxO | Retry (automatic, 1x) | Retry with different UTxO |
+| UTxO contention | Concurrent notarizations consume same UTxO | Retry (automatic, 1x after 2s, re-selects UTxO). Credit reservation held during retry. | Retry with different UTxO |
 | Script validation failure | Bug or invalid params | 500 + log | Investigate |
 | Node unreachable | Ogmios/Kupo down | 503 | Failover to DR |
 | Tx not confirmed | Submitted but not included in block | Poll, timeout after 5 min | Re-submit or alert |
@@ -688,28 +774,42 @@ Before building a notarization transaction, the API checks its cache for an exis
 
 | Field | Validation | Error |
 |-------|-----------|-------|
-| `document_hash` | Hex string, 64 chars (SHA-256) or 64 chars (BLAKE2b-256) | 400: "Invalid hash format" |
+| `document_hash` | Hex string, exactly 64 chars. Normalised to lowercase on receipt. Both SHA-256 and BLAKE2b-256 produce 32-byte (64 hex char) digests. | 400: "Invalid hash format" |
 | `hash_algorithm` | One of: `SHA-256`, `BLAKE2b-256` | 400: "Unsupported algorithm" |
-| `uri` | Valid URI format, max 256 bytes UTF-8 | 400: "Invalid URI" |
+| `uri` | Scheme must be one of: `https`, `http`, `ipfs`, `ar` (Arweave). Max 256 bytes UTF-8. All other schemes rejected. | 400: "Invalid URI" |
 | `description` | Max 256 bytes UTF-8 | 400: "Description too long" |
-| `destination` | Valid Bech32 Cardano address (mainnet or testnet as appropriate) | 400: "Invalid destination address" |
+| `destination` | Valid Bech32 Cardano address (mainnet or testnet as appropriate), validated via MeshJS address parsing | 400: "Invalid destination address" |
 
 ### 8.3 Rate Limiting
 
-- **Notarize:** 5 requests per minute per IP (nginx rate limit zone)
-- **Verify/Certificate/Recent/Stats:** 30 requests per minute per IP (standard API limits)
-- **Revoke:** 1 request per minute (operator only)
+Two layers, both enforced. The effective limit is the minimum of both:
+
+**Layer 1 — nginx IP-based (DDoS backstop):** Applies to ALL requests regardless of auth status.
+- Metered endpoints (notarize, revoke): 10 req/min per IP
+- Read endpoints (verify, certificate, recent, stats): 60 req/min per IP
+
+**Layer 2 — Per API key (application-level):** Applies to authenticated endpoints only. Configurable per key via `api_keys.rate_limit` (default: 60 req/min).
+
+A single client with one API key behind one IP is limited by whichever threshold is lower.
 
 ---
 
 ## 9. Security
 
-### 9.1 Operator Key Protection
+### 9.1 Notarizer Signing Key Protection
 
-- Signing key stored as environment variable path, never in code or config files
+The notarizer signing key (Cardano payment key) is loaded at API startup and held in process memory for the lifetime of the Express process.
+
+- Signing key path from environment variable (`NOTARY_SKEY_PATH`), never in code or config files
 - Key file permissions: `0400` (read-only, owner only)
 - Separate key for each network (preview, preprod, mainnet)
 - Mainnet key encrypted at rest (GPG, same pattern as KES cold keys)
+
+**Threat model:** If the Express process is compromised (RCE via dependency vulnerability), the signing key is in-process memory and could be exfiltrated. Mitigations:
+- Keep operator wallet balance low (~50 ADA reserve). Top up as needed.
+- `fee_lovelace` parameter acts as a drain-rate limiter (attacker must pay fee per mint)
+- BetterStack wallet balance monitor alerts on unexpected drops
+- Phase 2+: consider an external signing service with per-minute rate caps
 
 ### 9.2 API Authentication
 
@@ -725,10 +825,12 @@ plus nginx IP-based rate limits as backstop for unauthenticated endpoints.
 
 ### 9.3 Input Sanitisation
 
-- Document hash: hex-only regex (`/^[0-9a-f]{64}$/i`)
-- URI: sanitised, no script injection, stored as raw bytes on-chain
+- Document hash: hex-only regex (`/^[0-9a-f]{64}$/i`), normalised to lowercase before storage and comparison
+- URI: scheme whitelist (`https`, `http`, `ipfs`, `ar`) — all other schemes (including `javascript:`, `data:`) rejected. Stored as raw bytes on-chain. Displayed as plain text with a "visit link" button using `rel="noopener noreferrer" target="_blank"`. Never rendered as bare `<a href>` without scheme validation.
 - Description: sanitised, HTML-escaped on display, stored as raw bytes on-chain
 - Destination address: validated via MeshJS address parsing before use in transaction
+
+**Note on verification data:** All notarization data is public on-chain — the same information is available by querying the blockchain directly via Kupo or a block explorer. The API is a convenience layer, not an access control layer. The verify endpoint intentionally returns all matching data without authentication.
 
 ### 9.4 Front-End Security
 
@@ -739,7 +841,7 @@ plus nginx IP-based rate limits as backstop for unauthenticated endpoints.
 
 ### 9.5 On-Chain Security
 
-Already validated by the 13 Aiken unit tests + 2 property-based tests:
+Already validated by the 13 Aiken tests (11 unit + 2 property-based):
 - Notarizer signature required for mint and burn
 - One-shot UTxO consumption prevents replay
 - Exactly-one-token check prevents batch minting exploits
@@ -752,7 +854,7 @@ Already validated by the 13 Aiken unit tests + 2 property-based tests:
 
 ### 10.1 Contract Tests (Existing)
 
-13 Aiken unit tests + 2 property-based tests in `vault/validators/notary.ak`:
+13 Aiken tests (11 unit + 2 property-based) in `vault/validators/notary.ak`:
 - Happy path: notarize, with URI, with description, overpay fee
 - Failure path: no signature, underpay, no fee, wrong UTxO, double mint
 - Burn: success, no signature failure
@@ -843,20 +945,23 @@ Playwright E2E tests (extend existing harness):
 
 ## Appendix A: Slot-to-Timestamp Conversion
 
-Cardano slots map to POSIX time via network parameters:
+Cardano slots map to POSIX time via network-specific genesis parameters.
+All networks use 1-second slots post-Shelley.
 
 ```typescript
-// Preview testnet
-const SLOT_LENGTH = 1; // 1 second per slot
-const EPOCH_LENGTH = 86400; // 1 day
-const SYSTEM_START = 1666656000; // 2022-10-25T00:00:00Z (preview genesis)
+const NETWORK_GENESIS: Record<string, { systemStart: number; shelleyOffset: number }> = {
+  preview:  { systemStart: 1666656000, shelleyOffset: 0 },       // 2022-10-25T00:00:00Z
+  preprod:  { systemStart: 1654041600, shelleyOffset: 86400 },    // 2022-06-01T00:00:00Z + 1 day
+  mainnet:  { systemStart: 1596059091, shelleyOffset: 4924800 },  // 2020-07-29T21:44:51Z + 57 days
+};
 
-function slotToTimestamp(slot: number): Date {
-  return new Date((SYSTEM_START + slot) * 1000);
+function slotToTimestamp(slot: number, network: string): Date {
+  const genesis = NETWORK_GENESIS[network];
+  return new Date((genesis.systemStart + slot) * 1000);
 }
 ```
 
-The transaction's slot (from Kupo) gives the on-chain timestamp.
+The transaction's slot (from Kupo) gives the on-chain timestamp. Alternatively, use MeshJS or Ogmios utilities which handle the conversion internally.
 
 ## Appendix B: Token Name Example
 

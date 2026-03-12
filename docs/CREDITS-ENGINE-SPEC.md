@@ -116,7 +116,7 @@ npm package when a second service needs it — no imports from outside `lib/cred
 
 ```sql
 CREATE TABLE api_keys (
-  id            TEXT PRIMARY KEY,                 -- prefixed key ID (adv_live_...)
+  id            TEXT PRIMARY KEY,                 -- UUID v4 (not the API key itself)
   key_hash      TEXT NOT NULL UNIQUE,             -- SHA-256 of the full key (never store plaintext)
   key_prefix    TEXT NOT NULL,                    -- first 8 chars for identification (adv_live_Ab3x)
   name          TEXT NOT NULL,                    -- human label ("Russ's notary key")
@@ -137,8 +137,10 @@ CREATE TABLE api_keys (
 ```sql
 CREATE TABLE balances (
   key_id        TEXT PRIMARY KEY REFERENCES api_keys(id),
-  available     INTEGER NOT NULL DEFAULT 0,       -- usable credits (millicredits)
-  reserved      INTEGER NOT NULL DEFAULT 0,       -- held during in-flight requests
+  available     INTEGER NOT NULL DEFAULT 0       -- usable credits (millicredits)
+                CHECK (available >= 0),
+  reserved      INTEGER NOT NULL DEFAULT 0       -- held during in-flight requests
+                CHECK (reserved >= 0),
   lifetime_used INTEGER NOT NULL DEFAULT 0,       -- total credits ever consumed
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -155,7 +157,7 @@ CREATE TABLE ledger (
   key_id        TEXT NOT NULL REFERENCES api_keys(id),
   type          TEXT NOT NULL CHECK (type IN (
                   'topup', 'deduction', 'refund', 'reserve', 'release',
-                  'adjustment', 'expiry'
+                  'adjust', 'expiry'
                 )),
   amount        INTEGER NOT NULL,                 -- millicredits (positive = credit, negative = debit)
   balance_after INTEGER NOT NULL,                 -- balance snapshot after this entry
@@ -195,6 +197,13 @@ Example pricing:
 
 Free operations (verify, certificate) still go through the middleware for
 rate limiting and usage tracking — they just cost 0.
+
+**Pricing updates:** The `pricing` table uses a composite primary key
+`(service, operation, environment)`. Changing a price is an `UPDATE`, not an
+`INSERT` — this overwrites the previous price with no history. To preserve
+price history for auditing, add a new row with a different `effective_from`
+and query with `WHERE effective_from <= datetime('now') ORDER BY effective_from
+DESC LIMIT 1`. Phase 1 uses the simpler UPDATE approach.
 
 ---
 
@@ -249,6 +258,11 @@ Keys are **hashed** (SHA-256) before storage. Lookup flow:
 
 Phase 1: all keys get `["*"]`. Fine-grained scoping is the mechanism, but
 we don't need a UI for it yet.
+
+**Validation:** Permissions JSON MUST be validated on write (key creation and
+update). The `permissions` field must be a JSON array of non-empty strings
+matching `^[a-z_]+(:[a-z_]+)?$` or exactly `"*"`. On read, if parsing fails
+(corrupt data), the key MUST be treated as having no permissions (fail closed).
 
 ### 4.5 Lifecycle
 
@@ -347,7 +361,7 @@ responsible for confirming payment before calling it.
 | `deduct` | reserved -= amount, lifetime_used += amount | `deduction` | Request succeeds |
 | `release` | reserved -= amount, available += amount | `release` | Request fails |
 | `refund` | available += amount | `refund` | Operator-initiated |
-| `adjust` | available += amount (can be negative) | `adjustment` | Operator correction |
+| `adjust` | available += amount (can be negative) | `adjust` | Operator correction |
 
 ---
 
@@ -423,6 +437,11 @@ npm run credits:balance -- --key-prefix "adv_live_Ab3x"
 ```
 
 Implementation: calls `engine.topup()` directly. Reference = admin note.
+
+**Key prefix collision:** CLI tools that accept `--key-prefix` MUST verify the
+prefix matches exactly one key. If multiple keys share a prefix (e.g. two keys
+starting with `adv_live_Ab3x`), the command MUST fail with an error listing the
+matches and asking the operator to provide more characters.
 
 #### Stripe (Phase 2)
 
@@ -515,6 +534,8 @@ Authorization: Bearer adv_live_...
 ```
 GET /api/v1/credits/usage?from=2026-03-01&to=2026-03-12&service=notary
 Authorization: Bearer adv_live_...
+
+# Maximum date range: 90 days. Requests exceeding this return 400.
 ```
 
 **Response (200):**
@@ -679,9 +700,9 @@ function creditsMiddleware(opts: { service: string; operation: string }) {
     // 7. Attach context to request for downstream handlers
     req.credits = { keyId: key.id, cost, service: opts.service, operation: opts.operation };
 
-    // 8. Hook into response to deduct or release
-    const originalEnd = res.end;
-    res.end = function (...args) {
+    // 8. Hook into response completion via on-finished (handles normal, error, and aborted)
+    const onFinished = require('on-finished');
+    onFinished(res, () => {
       if (cost > 0) {
         if (res.statusCode >= 200 && res.statusCode < 300) {
           engine.deduct(key.id, cost, opts.service, req.credits.reference);
@@ -691,8 +712,7 @@ function creditsMiddleware(opts: { service: string; operation: string }) {
       }
       // Update last_used_at
       engine.touchKey(key.id);
-      return originalEnd.apply(this, args);
-    };
+    });
 
     next();
   };
@@ -717,13 +737,46 @@ Endpoints that don't go through `creditsMiddleware` are completely open —
 no API key, no rate limiting beyond nginx. This is intentional for
 verification (anyone should be able to verify without an account).
 
+### 8.5 Orphan Reservation Cleanup
+
+If a request crashes or the connection is aborted before `on-finished` fires
+(e.g. server OOM, uncaught exception), credits may remain in `reserved`
+indefinitely. A background cron job releases orphans:
+
+```typescript
+// Runs every 5 minutes
+function cleanupOrphanReservations() {
+  // Any reservation older than 10 minutes is considered orphaned.
+  // Normal request lifecycle completes in <30 seconds.
+  const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+  const orphans = db.prepare(`
+    SELECT key_id, SUM(amount) as total
+    FROM ledger
+    WHERE type = 'reserve'
+      AND created_at < ?
+      AND id NOT IN (
+        SELECT l2.id FROM ledger l2
+        WHERE l2.type IN ('deduction', 'release')
+          AND l2.reference = ledger.reference
+      )
+    GROUP BY key_id
+  `).all(cutoff);
+
+  for (const orphan of orphans) {
+    engine.release(orphan.key_id, orphan.total);
+    log.warn('Released orphan reservation', { keyId: orphan.key_id, amount: orphan.total });
+  }
+}
+```
+
 ---
 
 ## 9. Storage
 
 ### 9.1 SQLite
 
-Single file: `data/credits.db` (relative to adavault-api working directory).
+Single file, path configured via `CREDITS_DB_PATH` environment variable.
+Default: `data/credits.db` (relative to adavault-api working directory).
 
 **Why SQLite:**
 - No external database dependency (PostgreSQL, Redis etc.)
@@ -742,9 +795,12 @@ PRAGMA foreign_keys = ON;
 
 ### 9.2 Backup
 
-- SQLite backup via `.backup()` API or `sqlite3 .backup` command
-- Include in existing server backup scripts
-- WAL checkpoint before backup: `PRAGMA wal_checkpoint(TRUNCATE);`
+- **Schedule:** Hourly via cron (aligned with existing server backup jobs)
+- **Method:** SQLite `.backup()` API → local snapshot, then `rsync` to DR (vduweb62)
+- **RPO:** 1 hour (worst case: 1 hour of ledger entries lost)
+- **WAL checkpoint before backup:** `PRAGMA wal_checkpoint(TRUNCATE);`
+- **Retention:** 7 daily snapshots on primary, 3 on DR
+- **Restore:** Copy backup file over `credits.db`, restart API process
 - DR: replicate `credits.db` to vduweb62 (same pattern as JSON data files)
 
 ### 9.3 Migration
@@ -767,10 +823,10 @@ CREATE TABLE schema_version (
 
 | Concern | Mitigation |
 |---------|-----------|
-| Key theft | Keys hashed (SHA-256) before storage — DB leak doesn't expose keys |
+| Key theft | Keys hashed (SHA-256) before storage — DB leak doesn't expose keys. SHA-256 is sufficient here because API keys have 143 bits of entropy (24 base62 chars), making brute force of the hash computationally infeasible regardless of hash algorithm. HMAC-SHA256 or bcrypt would add no meaningful security given the input entropy. |
 | Key in logs | Middleware logs only the prefix (`adv_live_Ab3x****`) — never the full key |
 | Key in transit | HTTPS only (Cloudflare + nginx enforce TLS) |
-| Brute force | Rate limit on auth failures: 5 failed attempts per IP per minute → 15 min block |
+| Brute force | In-memory map tracking failed auth attempts per IP: 5 failures within 60 seconds → block that IP for 15 minutes. This is separate from per-key rate limiting (§8.2 step 4). Map entries expire via a cleanup interval every 5 minutes. Not persisted — resets on restart (acceptable: brute force is a sustained attack). |
 | Key rotation | Create new key, migrate credits, revoke old key |
 
 ### 10.2 Credit Security
@@ -779,7 +835,7 @@ CREATE TABLE schema_version (
 |---------|-----------|
 | Double-spend | SQLite transaction wraps reserve/deduct — atomic |
 | Race condition | `BEGIN IMMEDIATE` transaction for balance mutations |
-| Negative balance | `CHECK (available >= 0)` constraint in SQL |
+| Negative balance | `CHECK (available >= 0)` and `CHECK (reserved >= 0)` constraints in SQL |
 | Phantom credits | Append-only ledger — every movement auditable |
 | Operator abuse | Ledger entries include provider + reference — traceable |
 
@@ -835,6 +891,14 @@ npm run credits:backup          # Backup credits.db
 - DR API reads from local replica
 - Writes only on primary (vduweb42) — DR is read-only for credits
 - Failover: if primary down, DR serves read endpoints (balance, usage) but blocks mutations
+
+**Off-chain state acknowledgement:** Credit balances are off-chain state. Unlike
+on-chain token balances, they can be lost if backups fail. RPO is 1 hour (§9.2).
+In the event of unrecoverable data loss, the append-only ledger can be
+reconstructed from payment provider records (Stripe payment IDs, on-chain tx
+hashes) and API access logs. This is an accepted trade-off for operational
+simplicity — PostgreSQL replication is available as an upgrade path if RPO
+requirements tighten.
 
 ---
 
