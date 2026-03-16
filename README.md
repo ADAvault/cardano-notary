@@ -10,19 +10,97 @@ Timestamps document hashes on the Cardano blockchain by minting a unique NFT for
 
 ## How It Works
 
-1. User submits a document hash (and optional URI, description)
-2. The notary operator signs and submits a transaction that mints a unique NFT
-3. The NFT's datum stores the document hash, hash algorithm, URI, and notarizer identity
-4. The transaction's on-chain validity range proves the document existed at that time
-5. Anyone can verify by looking up the NFT and reading its datum
+1. User drops a file in the browser — SHA-256 hash computed locally (file never leaves the device)
+2. Browser sends the hash to the notary API with a Bearer token
+3. API builds a Cardano transaction that mints a unique NFT with the hash in its datum
+4. API signs and submits the transaction via Ogmios
+5. The transaction's on-chain validity range proves the document existed at that time
+6. A reference code (`ADV-N-260316-a7b3c`) is returned for the user's records
+7. Anyone can verify by computing the file's hash and checking it against the blockchain
+
+## Transaction Flow
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────┐
+│  Browser  │     │  Notary API  │     │  Ogmios  │     │ Cardano  │
+└─────┬────┘     └──────┬───────┘     └─────┬────┘     └─────┬────┘
+      │                  │                    │                │
+      │ 1. Hash file     │                    │                │
+      │  (client-side)   │                    │                │
+      │                  │                    │                │
+      │ 2. POST /notarize│                    │                │
+      │  {hash, apiKey}  │                    │                │
+      │─────────────────>│                    │                │
+      │                  │                    │                │
+      │                  │ 3. Select UTxO     │                │
+      │                  │    Derive token    │                │
+      │                  │    name (blake2b)  │                │
+      │                  │                    │                │
+      │                  │ 4. Build tx:       │                │
+      │                  │  - Consume UTxO    │                │
+      │                  │  - Mint NFT        │                │
+      │                  │  - Inline datum    │                │
+      │                  │  - Fee output      │                │
+      │                  │                    │                │
+      │                  │ 5. Evaluate fees   │                │
+      │                  │───────────────────>│                │
+      │                  │<───────────────────│                │
+      │                  │                    │                │
+      │                  │ 6. Sign + Submit   │                │
+      │                  │───────────────────>│                │
+      │                  │                    │───────────────>│
+      │                  │                    │  7. Validate   │
+      │                  │                    │  - Script pass │
+      │                  │                    │  - Mint NFT    │
+      │                  │                    │  - Add to chain│
+      │                  │                    │<───────────────│
+      │                  │<───────────────────│                │
+      │                  │                    │                │
+      │ 8. {txHash,      │                    │                │
+      │  reference,      │                    │                │
+      │  policyId}       │                    │                │
+      │<─────────────────│                    │                │
+      │                  │                    │                │
+
+Verification (free, no auth):
+      │ GET /verify/{hash}│                    │                │
+      │─────────────────>│ Query Kupo for     │                │
+      │                  │ matching NFT datum  │                │
+      │ {verified, certs}│                    │                │
+      │<─────────────────│                    │                │
+```
+
+## On-Chain Transaction Structure
+
+What you see on Cardanoscan for each notarization:
+
+```
+Transaction
+├── Input:   UTxO from operator wallet (consumed for one-shot uniqueness)
+├── Mint:    +1 NFT under the notary policy ID
+│            Token name = blake2b_256(serialised UTxO reference)
+├── Output 1: NFT + 2 ADA → destination address
+│             Inline datum: {hash, algorithm, uri?, notarizer, reference}
+├── Output 2: Fee → operator wallet (cost-neutral)
+├── Output 3: Change → operator wallet
+├── Collateral: Pure-ADA UTxO (required for Plutus scripts)
+├── Required signer: Operator key hash
+└── Validity range: [slot, slot+N] (ledger-enforced timestamp)
+```
 
 ## Architecture
 
 ```
-User → notary.adavault.com API → Build Tx → Sign → Submit → Cardano
-         (or any SPO's API)
-
-Verification: Look up NFT by policy ID → Read datum → Compare document hash
+Browser → adavault.com/notary (Cloudflare Pages, static)
+  │
+  ├─ Hash file locally (Web Crypto SHA-256)
+  │
+  └─ POST /api/v1/notary/notarize → API server (Express)
+       │
+       ├─ Build tx with MeshJS + MeshTxBuilder
+       ├─ Evaluate via Ogmios (fee estimation)
+       ├─ Sign with operator key (AppWallet)
+       └─ Submit via Ogmios → Cardano node → on-chain
 ```
 
 ### Smart Contract
@@ -45,9 +123,11 @@ NotaryDatum {
   hash_algorithm: ByteArray,      -- "SHA-256", "BLAKE2b-256", etc.
   uri: Option<ByteArray>,         -- Where the source document lives (IPFS, URL, etc.)
   notarizer: ByteArray,           -- Who notarized it
-  description: Option<ByteArray>, -- Optional context
+  reference: Option<ByteArray>,   -- Generated ref: [TICKER]-N-[YYMMDD]-[HASH]
 }
 ```
+
+The `reference` field replaced a free-text `description` to prevent on-chain abuse and ensure predictable fees. Format: `ADV-N-260316-a7b3c` where ADV is the operator ticker, N is the service type (Notary), and the suffix is derived from the token name.
 
 ## Advantages Over Bitcoin OP_RETURN
 
