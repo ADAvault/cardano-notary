@@ -129,6 +129,47 @@ NotaryDatum {
 
 The `reference` field replaced a free-text `description` to prevent on-chain abuse and ensure predictable fees. Format: `ADV-N-260316-a7b3c` where ADV is the operator ticker, N is the service type (Notary), and the suffix is derived from the token name.
 
+### Performance
+
+The contract is **O(1) per operation** — every notarization costs the same regardless of how many have been done before.
+
+| Operation | Complexity | Notes |
+|-----------|-----------|-------|
+| Notarize | O(1) | One tx, one NFT mint. Script validates current tx only. |
+| Verify by hash | O(1) | Direct key lookup via chain indexer (Kupo). |
+| Get certificate | O(1) | Direct key lookup by policy ID + token name. |
+| List all | O(N) | Indexer query. API-level concern, not contract. |
+
+The contract never reads historical state. No loops, no accumulation, no on-chain lookups. The 1,000,000th notarization executes identically to the 1st.
+
+**Scaling considerations:**
+- Kupo DB: ~1KB per notarization. 1M notarizations ≈ 1GB — manageable.
+- API cache: refreshes every 60s. At high volumes, paginate the cache query.
+- On-chain: each NFT is an independent UTxO. No contention between concurrent notarizations (UTxO locking handles this at the API level).
+
+### Versioning
+
+The policy ID is a hash of the compiled contract code + parameters. Any change produces a new policy ID — effectively a new version.
+
+**To upgrade:**
+1. Modify the contract or parameters
+2. Compile → new policy ID
+3. Deploy the new version alongside the old
+4. Old notarizations remain valid forever under the old policy ID
+5. The API can serve certificates from multiple policy IDs
+
+No migration contract. No state to move. Old certificates are immutable on-chain.
+
+**Parameter changes that create a new version:**
+- `notarizer` — different operator key hash
+- `fee_lovelace` — different fee amount
+- Contract code changes — any logic modification
+
+**What stays the same across versions:**
+- Datum structure (backward-compatible parsing)
+- Reference format (`[TICKER]-N-[YYMMDD]-[HASH]`)
+- Verification flow (hash lookup is policy-agnostic)
+
 ## Advantages Over Bitcoin OP_RETURN
 
 | Feature | Bitcoin (OP_RETURN) | Cardano Notary |
