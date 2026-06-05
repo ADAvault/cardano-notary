@@ -39,13 +39,16 @@ were mothballed.
 
 ## Mothball teardown record (2026-06-05)
 
-- vducdn59: `docker rm -f ogmios kupo` (recipes captured here); kupo-db volume
-  <SNAPSHOT/REMOVE decision recorded at teardown>; `cnode-submit-api.service`
-  stopped + disabled. cnode + mithril-signer **kept running**.
-- 6 relays: `socat-n2c.service` stopped + disabled; relay `:6000` ufw allow removed.
-- er4: relay `:6000` inbound rules removed (GH#58).
-- **VMs powered off (disks intact — NOT deleted):** vduogm51, vduogm81. Restart
-  = power on; their on-disk Ogmios config is preserved (not re-captured here).
+- vducdn59: `docker rm -f ogmios kupo`; **kupo-db volume removed** (rebuildable
+  from origin via `--since origin` — no cruft); `cnode-submit-api.service`
+  stopped + disabled. cnode + mithril-signer **kept running**. UFW then enabled
+  (cdn59 is now a standard preview-relay + mithril — GH#63/#28).
+- 6 relays: `socat-n2c.service` stopped + disabled; relay `:6000` ufw allow
+  removed; relays converged to the canonical UFW set (GH#58 done).
+- er4: no router `:6000` rule existed (it was host-UFW only) — nothing to remove.
+- **VMs already powered off, autostart disabled (disks intact — NOT deleted):**
+  vduogm51 (pdukvm15), vduogm81 (pdukvm18). Restart = power on; their on-disk
+  Ogmios config is preserved (not re-captured here).
 - DNS entries for vduogm51/81/vducdn59 **kept** (VMs only powered off).
 
 ## Captured because it was host-only (not in any repo)
