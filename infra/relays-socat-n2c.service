@@ -1,0 +1,17 @@
+# /etc/systemd/system/socat-n2c.service -- captured 2026-06-05 (GH#63).
+# Identical on all 6 mainnet relays (vducdn12/23/37/48/66/87). Exposes the local
+# cardano node.socket over TCP :6000 so a mainnet Ogmios host dials in (N2C bridge).
+# Restart: place on each relay, `systemctl enable --now socat-n2c.service`, and
+# reinstate the :6000 firewall allows (see relays-6000-firewall.md).
+[Unit]
+Description=Cardano N2C TCP bridge for Ogmios
+After=cnode.service
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:6000,reuseaddr,fork UNIX-CONNECT:/opt/cardano/cnode/sockets/node.socket
+Restart=on-failure
+RestartSec=5
+User=cardano
+
+[Install]
+WantedBy=multi-user.target
