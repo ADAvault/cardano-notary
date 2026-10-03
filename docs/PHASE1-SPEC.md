@@ -228,7 +228,7 @@ Admin                          API                            Cardano
 
 ### Contract Source
 
-`/home/rezi/products/vault/validators/notary.ak` — no changes needed for Phase 1.
+`validators/notary.ak` in the `adavault/vault` Aiken project (compiled blueprint: `contract/plutus.json`) — no changes needed for Phase 1.
 
 ### Parameters
 
@@ -1030,7 +1030,7 @@ Build order with dependencies. Each phase has a test gate that must pass before 
 - `on-finished` fires on connection abort
 - Orphan cleanup releases stale reservations
 - Brute force tracking blocks after 5 failures, clears after 15 min
-- Manual smoke test against dev API (vduweb32)
+- Manual smoke test against the dev API
 
 ### Phase C: Notary API Routes
 
@@ -1106,9 +1106,9 @@ Build order with dependencies. Each phase has a test gate that must pass before 
 2. Fund operator wallet (~50 ADA)
 3. Deploy reference script on mainnet
 4. Add Kupo pattern for mainnet notary policy ID
-5. Deploy to vduweb42 (production) — see §13.2
-6. Deploy to vduweb62 (DR) — see §13.3
-7. Configure nginx on vduprx05 and pduprx06 — see §13.4, §13.5
+5. Deploy to production — see §13.2
+6. Deploy to DR — see §13.3
+7. Configure nginx on both reverse proxies — see §13.4, §13.5
 8. DNS (if new domain — pending branding decision)
 9. Enable BetterStack monitors
 10. Smoke test on mainnet
@@ -1122,7 +1122,7 @@ Step-by-step checklist for deploying to production.
 
 ### 13.1 Prerequisites
 
-- [ ] Credits engine tested on dev (vduweb32) — all unit and middleware tests passing
+- [ ] Credits engine tested on dev — all unit and middleware tests passing
 - [ ] Notary API tested on preview — all Phase C tests passing
 - [ ] Notary API tested on preprod — full lifecycle regression passing
 - [ ] CxO approval for mainnet release
@@ -1134,11 +1134,11 @@ Step-by-step checklist for deploying to production.
 - [ ] BetterStack monitors configured (created, not yet enabled)
 - [ ] Credits backup cron script prepared
 
-### 13.2 Production Deployment (vduweb42)
+### 13.2 Production Deployment
 
 ```bash
 # 1. SSH to production API server
-ssh rezi@vduweb42
+ssh <user>@<api-prod>
 
 # 2. Pull latest code
 cd ~/products/adavault-api
@@ -1184,16 +1184,16 @@ curl -X POST http://localhost:3001/api/v1/notary/notarize \
 npm run credits:balance -- --key-prefix "adv_live_XXXX"
 
 # 11. Set up credits backup cron (hourly)
-# 0 * * * * /home/rezi/products/adavault-api/scripts/backup-credits.sh
+# 0 * * * * $HOME/products/adavault-api/scripts/backup-credits.sh
 ```
 
-### 13.3 DR Deployment (vduweb62)
+### 13.3 DR Deployment
 
 DR is read-only for credits mutations. Write operations (notarize, burn, topup) are blocked.
 
 ```bash
 # 1. SSH via jump host
-ssh -J rezi@ren rezi@vduweb62
+ssh -J <user>@<jump-host> <user>@<api-dr>
 
 # 2. Pull and build
 cd ~/products/adavault-api
@@ -1206,8 +1206,7 @@ npm run build
 npm run credits:migrate
 
 # 4. Copy credits.db from primary (initial sync)
-# From vduweb42:
-rsync -avz rezi@vduweb42:~/products/adavault-api/data/credits.db \
+rsync -avz <user>@<api-prod>:~/products/adavault-api/data/credits.db \
   ~/products/adavault-api/data/credits.db
 
 # 5. Set environment variables (same as production + CREDITS_READ_ONLY=true)
@@ -1219,11 +1218,11 @@ pm2 restart adavault-api-prod
 curl http://localhost:3001/health
 ```
 
-### 13.4 Reverse Proxy — vduprx05 (Linux)
+### 13.4 Reverse Proxy — Production
 
 ```bash
-ssh rezi@vduprx05
-sudo vi /etc/nginx/sites-available/api-adavault-com.conf
+ssh <user>@<proxy-prod>
+sudo vi /etc/nginx/sites-available/<api-site>.conf
 
 # Add rate limiting zones (in http context):
 #   limit_req_zone $binary_remote_addr zone=notary_write:10m rate=10r/m;
@@ -1247,15 +1246,14 @@ sudo nginx -t && sudo systemctl reload nginx
 curl https://api.adavault.com/api/v1/notary/stats
 ```
 
-### 13.5 DR Reverse Proxy — pduprx06 (FreeBSD)
+### 13.5 Reverse Proxy — DR
 
 ```bash
-ssh -J rezi@ren cyberruss@pduprx06
-sudo vi /usr/local/etc/nginx/servers/api2.adavault.com.conf
+ssh -J <user>@<jump-host> <user>@<proxy-dr>
 
-# Add same rate limiting zones and location blocks as vduprx05
+# Add the same rate limiting zones and location blocks as §13.4
+# to the DR API site's nginx config, then test and reload nginx
 
-sudo nginx -t && sudo service nginx reload
 curl https://api2.adavault.com/api/v1/notary/stats
 ```
 
@@ -1265,7 +1263,7 @@ curl https://api2.adavault.com/api/v1/notary/stats
 2. **BetterStack — DR:** Same for `https://api2.adavault.com/api/v1/notary/stats`.
 3. **Wallet balance alert:** BetterStack keyword monitor on `/health` response — alert if `notary_wallet_ada` drops below 20.
 4. **Credits backup cron:** Verify hourly cron is running: `crontab -l | grep credits`
-5. **DR rsync:** Verify `credits.db` on vduweb62 is within 1 hour of primary.
+5. **DR rsync:** Verify `credits.db` on the DR server is within 1 hour of primary.
 
 ### 13.7 Rollback Plan
 
@@ -1288,11 +1286,8 @@ pm2 start adavault-api-prod
 
 **nginx rollback:**
 ```bash
-# vduprx05: remove notary blocks, reload
+# On each reverse proxy (production and DR): remove notary blocks, reload
 sudo nginx -t && sudo systemctl reload nginx
-
-# pduprx06 (via jump host, as cyberruss): remove notary blocks, reload
-sudo nginx -t && sudo service nginx reload
 ```
 
 **On-chain — no rollback possible.** Minted NFTs are permanent. Burned NFTs cannot be re-minted. The reference script UTxO remains on-chain. This is expected — on-chain state is the source of truth.
@@ -1306,7 +1301,7 @@ sudo nginx -t && sudo service nginx reload
 - [ ] Certificate page renders correctly
 - [ ] Verification returns the test notarization
 - [ ] Credits backup cron running (verified by file timestamps)
-- [ ] DR rsync verified (credits.db on vduweb62 is current)
+- [ ] DR rsync verified (credits.db on the DR server is current)
 - [ ] Wallet balance monitor configured and tested
 - [ ] Admin API key stored securely (not in shared notes, not in git)
 - [ ] CxO notified of go-live

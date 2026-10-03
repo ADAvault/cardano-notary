@@ -797,12 +797,12 @@ PRAGMA foreign_keys = ON;
 ### 9.2 Backup
 
 - **Schedule:** Hourly via cron (aligned with existing server backup jobs)
-- **Method:** SQLite `.backup()` API → local snapshot, then `rsync` to DR (vduweb62)
+- **Method:** SQLite `.backup()` API → local snapshot, then `rsync` to DR
 - **RPO:** 1 hour (worst case: 1 hour of ledger entries lost)
 - **WAL checkpoint before backup:** `PRAGMA wal_checkpoint(TRUNCATE);`
 - **Retention:** 7 daily snapshots on primary, 3 on DR
 - **Restore:** Copy backup file over `credits.db`, restart API process
-- DR: replicate `credits.db` to vduweb62 (same pattern as JSON data files)
+- DR: replicate `credits.db` to the DR server (same pattern as JSON data files)
 
 ### 9.3 Migration
 
@@ -888,9 +888,9 @@ npm run credits:backup          # Backup credits.db
 
 ### 11.3 DR
 
-- `credits.db` synced to DR server (vduweb62) via rsync (same as JSON data files)
+- `credits.db` synced to DR server via rsync (same as JSON data files)
 - DR API reads from local replica
-- Writes only on primary (vduweb42) — DR is read-only for credits
+- Writes only on primary — DR is read-only for credits
 - Failover: if primary down, DR serves read endpoints (balance, usage) but blocks mutations
 
 **Off-chain state acknowledgement:** Credit balances are off-chain state. Unlike

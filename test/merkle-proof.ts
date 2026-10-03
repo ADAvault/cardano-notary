@@ -18,9 +18,9 @@
  *   - Continuing output at same script address with new_root and same owner
  *
  * Prerequisites:
- *   - SSH tunnel: ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 cardano@vducdn59
+ *   - Ogmios and Kupo for a preview node (OGMIOS_URL, KUPO_URL; see config.ts)
  *   - Payment signing key at test/keys/payment.skey
- *   - Kupo synced to tip on vducdn59
+ *   - Kupo synced to tip
  *
  * Usage:
  *   npx tsx test/merkle-proof.ts lock     # Lock 5 tADA with MerkleDatum

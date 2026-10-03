@@ -22,9 +22,9 @@
  * The validator just checks tx.extra_signatories, so this is valid.
  *
  * Prerequisites:
- *   - SSH tunnel: ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 cardano@vducdn59
+ *   - Ogmios and Kupo for a preview node (OGMIOS_URL, KUPO_URL; see config.ts)
  *   - Payment signing key at test/keys/payment.skey
- *   - Kupo synced to tip on vducdn59
+ *   - Kupo synced to tip
  *
  * Usage:
  *   npx tsx test/escrow.ts lock        # Lock 5 tADA at escrow script

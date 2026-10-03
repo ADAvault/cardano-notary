@@ -231,8 +231,13 @@ cardano-notary/
 ### Setup
 
 ```bash
-# SSH tunnel to your node (adjust host as needed)
-ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 cardano@your-node
+# Point the tests at your node's Ogmios and Kupo
+# (defaults: http://localhost:1337 and http://localhost:1442)
+export OGMIOS_URL=http://<your-node>:1337
+export KUPO_URL=http://<your-node>:1442
+
+# ...or forward the ports and keep the defaults
+ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 <user>@<your-node>
 
 # Copy your payment signing key
 cp /path/to/payment.skey test/keys/payment.skey

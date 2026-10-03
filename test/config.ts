@@ -1,16 +1,16 @@
 /**
  * Test configuration for preview testnet integration tests.
  *
- * Providers:
- *   - Ogmios (tx evaluation + submission): localhost:1337 via SSH tunnel
- *   - Kupo (UTxO fetcher): localhost:1442 via SSH tunnel
+ * Providers (any preview node with Ogmios and Kupo):
+ *   - Ogmios (tx evaluation + submission): OGMIOS_URL, default http://localhost:1337
+ *   - Kupo (UTxO fetcher): KUPO_URL, default http://localhost:1442
  *
- * SSH tunnels (run before testing):
- *   ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 cardano@vducdn59
+ * If the node is on another machine, set the two URLs or forward the ports:
+ *   ssh -N -L 1337:localhost:1337 -L 1442:localhost:1442 <user>@<your-node>
  *
  * Wallet:
- *   Uses preview testnet wallet keys from vducdn59.
- *   Copy payment.skey to test/keys/ (gitignored).
+ *   A funded preview testnet payment key.
+ *   Copy payment.skey to test/keys/ (gitignored), or set PAYMENT_SKEY_PATH.
  */
 
 import { readFileSync } from "fs";
@@ -24,12 +24,13 @@ export const config = {
   network: "preview" as const,
   networkId: 0, // 0 = testnet, 1 = mainnet
 
-  // Provider endpoints (via SSH tunnel to vducdn59)
-  ogmiosUrl: "http://localhost:1337",
-  kupoUrl: "http://localhost:1442",
+  // Provider endpoints (from the environment, else local or tunnelled ports)
+  ogmiosUrl: process.env.OGMIOS_URL || "http://localhost:1337",
+  kupoUrl: process.env.KUPO_URL || "http://localhost:1442",
 
   // Wallet key (preview testnet only)
-  paymentSkeyPath: join(__dirname, "keys", "payment.skey"),
+  paymentSkeyPath:
+    process.env.PAYMENT_SKEY_PATH || join(__dirname, "keys", "payment.skey"),
 
   // Notary contract parameters
   notary: {
